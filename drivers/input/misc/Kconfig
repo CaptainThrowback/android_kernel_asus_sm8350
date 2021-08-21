@@ -959,12 +959,14 @@ config INPUT_SX932X_VODKA
 	  module will be called INPUT_SX932X_VODKA.
 
 config ASUS
+       tristate
        default n
        help
           Say Y here if charge ready.
           If unsure, say N.
 
 config CAP_DEBUG
+       tristate
        default n
        help
           Say Y here if charge ready.
