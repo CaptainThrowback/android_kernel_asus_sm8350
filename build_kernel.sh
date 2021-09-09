@@ -1,7 +1,7 @@
 #!/bin/bash
 
 Defconfig_Folder=arch/arm64/configs
-Kernel_Root=~/android/build/kernel/asus/ZS590KS
+Kernel_Root=$PWD
 Android_Build=~/android/build/AOSP/android-11
 Clang_Google=prebuilts/clang/host
 Prebuilt_Clang=clang-r383902
