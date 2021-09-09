@@ -172,6 +172,9 @@ vdso_install:
 archclean:
 	$(Q)$(MAKE) $(clean)=$(boot)
 
+CLEAN_FILES += out/$(boot)/Image out/$(boot)/Image-dtb out/$(boot)/Image.* out/$(boot)/dtb.img out/$(boot)/dtbo.img
+MRPROPER_FILES += out/$(boot)/Image out/$(boot)/Image-dtb out/$(boot)/Image.* out/$(boot)/dtb.img out/$(boot)/dtbo.img
+
 ifeq ($(KBUILD_EXTMOD),)
 # We need to generate vdso-offsets.h before compiling certain files in kernel/.
 # In order to do that, we should use the archprepare target, but we can't since
