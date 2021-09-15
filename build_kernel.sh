@@ -1,7 +1,7 @@
 #!/bin/bash
 
 Defconfig_Folder=arch/arm64/configs
-Kernel_Root=~/android/build/kernel/asus/ZS590KS
+Kernel_Root=$PWD
 Android_Build=~/android/build/AOSP/android-11
 Clang_Google=prebuilts/clang/host
 Prebuilt_Clang=clang-r383902
@@ -65,7 +65,18 @@ export CC=$CLANG_CC
 export HOST_CC=$CLANG_CC
 export LD=$CLANG_LD
 
-export ASUS_BUILD_PROJECT=SAKE
+select device in "ZenFone 8" "ROG Phone 5"; do
+	case $device in
+		"ZenFone 8")
+			export ASUS_BUILD_PROJECT=SAKE
+			break
+			;;
+		"ROG Phone 5")
+			export ASUS_BUILD_PROJECT=ZS673KS
+			break
+			;;
+	esac
+done
 
 echo
 echo "Choose DEFCONFIG"
