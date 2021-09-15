@@ -26,16 +26,11 @@ select yn in "Yes" "No"; do
 	esac
 done
 
-echo
-echo "Issue Build Commands"
-echo
-
 mkdir -p out
 export ARCH=arm64
 export SUBARCH=arm64
 export CLANG_PREBUILT_BIN=$Android_Build/$Clang_Google/linux-x86/$Prebuilt_Clang/bin
 export PATH=${CLANG_PREBUILT_BIN}:${PATH}
-export DTC_EXT=$Kernel_Root/dtc-aosp
 export CLANG_TRIPLE=aarch64-linux-gnu-
 export CROSS_COMPILE=$Android_Build/$GCC_Google_Arm64/aarch64-linux-android-4.9/bin/aarch64-linux-androidkernel-
 export CROSS_COMPILE_COMPAT=$Android_Build/$GCC_Google_Arm32/arm-linux-androideabi-4.9/bin/arm-linux-androideabi-
@@ -65,6 +60,10 @@ export CC=$CLANG_CC
 export HOST_CC=$CLANG_CC
 export LD=$CLANG_LD
 
+echo
+echo "Choose Device:"
+echo
+
 select device in "ZenFone 8" "ROG Phone 5"; do
 	case $device in
 		"ZenFone 8")
@@ -79,7 +78,7 @@ select device in "ZenFone 8" "ROG Phone 5"; do
 done
 
 echo
-echo "Choose DEFCONFIG"
+echo "Choose DEFCONFIG:"
 echo 
 
 DEFCONFIG=($(find $Defconfig_Folder -iname '*config*' -type f -exec echo '{}' \; | awk -F'configs/' '{print $NF}'))
