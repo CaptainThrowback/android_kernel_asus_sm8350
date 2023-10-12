@@ -73,6 +73,8 @@ struct ADSP_ChargerPD_Info {
     int     thermel_threshold;
     int     boot_completed;
     bool    in_call;
+    u32     launchedtime;
+    bool    b_is_MTBF_device;
 };
 
 struct battman_oem_read_buffer_req_msg { 
@@ -164,6 +166,7 @@ enum battman_oem_property {
     BATTMAN_OEM_THERMAL_SENSOR,
     BATTMAN_OEM_FV,
     BATTMAN_OEM_In_Call,
+    BATTMAN_OEM_Set_MTBF,
     BATTMAN_OEM_PROPERTY_MAX,
 };
 

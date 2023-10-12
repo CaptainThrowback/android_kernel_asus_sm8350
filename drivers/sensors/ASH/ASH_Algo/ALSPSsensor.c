@@ -29,6 +29,7 @@
 #include <linux/miscdevice.h>
 #include <asm/uaccess.h>
 #include <linux/ioctl.h>
+#include <linux/alarmtimer.h>
 
 /**************************/
 /* Debug and Log System */
@@ -41,7 +42,7 @@
 #else
 	#define dbg(fmt, args...)
 #endif
-#define log(fmt, args...) printk(KERN_INFO "[%s][%s][%s]"fmt,MODULE_NAME,SENSOR_TYPE_NAME,__func__,##args)
+#define log(fmt, args...) printk(KERN_INFO "[%s]"fmt,MODULE_NAME,##args)
 #define err(fmt, args...) do{	\
 		printk(KERN_ERR "[%s][%s]"fmt,MODULE_NAME,SENSOR_TYPE_NAME,##args);	\
 		sprintf(g_error_mesg, "[%s][%s]"fmt,MODULE_NAME,SENSOR_TYPE_NAME,##args);	\
@@ -51,9 +52,7 @@
 /* ALSPSsensor Sensor Global Variables */
 /*****************************/
 static int ALSPS_SENSOR_IRQ;
-#ifndef CONFIG_TMD2755_FLAG
 static int ALSPS_SENSOR_INT;
-#endif
 static struct lsensor_data			*g_als_data;
 static struct psensor_data			*g_ps_data;
 //HW global
@@ -63,17 +62,16 @@ static struct workqueue_struct 		*ALSPS_delay_workqueue;
 struct mutex 				g_alsps_lock;
 static struct mutex 				g_i2c_lock;
 static struct wakeup_source			*g_alsps_wake_lock;
+static struct wakeup_source *g_alsps_oil_wake; //used for sake due to bad oil cover probability during phone call
 static struct hrtimer 			g_alsps_timer;
 static struct i2c_client *g_i2c_client;
 static bool g_alsps_probe_status = false;
+tmd2755_status_param g_tmd2755_status_param;
 
-#ifdef CONFIG_TMD2755_FLAG
-static struct wakeup_source			*g_alsps_oil_wake;
-extern bool g_tmd2755_probe_status;
-extern void tmd2755_suspend(void);
-extern void tmd2755_resume(void);
+struct work_struct	g_oil_polling_work;
+struct alarm	g_oil_alarm_timer;
+static int G_oil_timer=1000;
 extern enum DEVICE_HWID g_ASUS_hwID;
-#endif
 
 static int g_als_last_lux = 0;
 static char *g_error_mesg;
@@ -141,7 +139,7 @@ Therefore, do this function at turn_onoff when load_cal = 1 */
 static int mproximity_store_load_calibration_data(void);
 
 /*Work Queue*/
-static 		DECLARE_WORK(ALSPS_ist_work, ALSPS_ist);
+static 		DECLARE_DELAYED_WORK(ALSPS_ist_work, ALSPS_ist);
 static 		DECLARE_WORK(proximity_autok_work, proximity_autok);
 static 		DECLARE_DELAYED_WORK(proximity_polling_adc_work, proximity_polling_adc);
 static 		DECLARE_DELAYED_WORK(light_polling_lux_work, light_polling_lux);
@@ -149,6 +147,11 @@ static 		DECLARE_DELAYED_WORK(light_polling_lux_work, light_polling_lux);
 /*Disable touch for detecting near when phone call*/
 //extern void ftxxxx_disable_touch(bool flag);
 extern int get_audiomode(void);
+
+#ifdef CONFIG_TMD2755_FLAG
+extern void tmd2755_suspend(void);
+extern void tmd2755_resume(void);
+#endif
 
 /*******************************/
 /* ALS and PS data structure */
@@ -177,13 +180,15 @@ struct psensor_data
 	int crosstalk_diff;
 
 	int selection;
+
+	/* ASUS BSP: add psensor recovery status for re-autok issue */
+	int recovery_mode;
+
 	/* ASUS BSP+++ Clay: dynamic proxmity period due to psensor noise effect */
 	int cur_period;
 	/* ASUS BSP--- */
-#ifdef CONFIG_TMD2755_FLAG
 	int g_ps_calvalue_offset;						/* Proximitysensor setting offset calibration value */
 	int oil_flag;						/* Proximitysensor setting oil algo. en/disable */
-#endif
 	bool pocket_mode;
 };
 
@@ -206,8 +211,10 @@ struct lsensor_data
 	int dynamic_sensitive;			/* used in dynamic control machanism */
 	uint8_t dynamic_IT;					/* used in dynamic control machanism */
 	
-	struct timespec ts; 
+	struct timespec IT_change_ts; 
 	u64 evt_skip_time_ns;
+	struct timespec prox_ts; 
+	u64 prox_off_debounce_time_ns;
 	
 	int g_als_retry_count;                          /* polling workqueue retry to get adc count, set 0 when polling cancel */
 	
@@ -361,36 +368,16 @@ static struct i2c_test_case_info ALSPS_TestCaseInfo[] ={
  *|| Device Layer Part ||
  *====================
  */ 
-#ifdef CONFIG_TMD2755_FLAG
-static void proximity_oil_wake_lock_check(void){
-	static bool oil_wake_status = false;
-	if(false == g_ps_data->HAL_switch_on || false == g_ps_data->oil_flag){
-		if(oil_wake_status == true){
-			__pm_relax(g_alsps_oil_wake);
-			oil_wake_status = false;
-			log("release oil wake lock");
-		}
-	}else{
-		if(true == g_ps_data->oil_flag){
-			if(g_ps_data->g_ps_int_status == ALSPS_INT_PS_AWAY){
-				if(true == oil_wake_status){
-					__pm_relax(g_alsps_oil_wake);
-					oil_wake_status = false;
-					log("release oil wake lock");
-				}
-			}else{
-				if(false == oil_wake_status){
-					__pm_stay_awake(g_alsps_oil_wake);
-					oil_wake_status = true;
-					log("set oil wake lock");
-				}
-			}
-		}
-	}
+static enum alarmtimer_restart oil_algo_timer(struct alarm *alarm, ktime_t now)
+{
+	/* timer callback runs in atomic context, cannot use voter */
+	log("Alarm for oil algorithm");
+	__pm_stay_awake(g_alsps_oil_wake);
+	schedule_work(&g_oil_polling_work);
+	return ALARMTIMER_NORESTART;
 }
-#endif
 
- static void proximity_turn_on_check(void){
+static void proximity_turn_on_check(void){
 #ifndef CONFIG_TMD2755_FLAG
 	int adc_value, threshold_high;
 #endif
@@ -402,7 +389,7 @@ static void proximity_oil_wake_lock_check(void){
 			light_sensor_reset_status();
 			/* ASUS BSP Clay: ---*/
 #ifndef CONFIG_TMD2755_FLAG
-			msleep(PROXIMITY_TURNON_DELAY_TIME);
+			msleep(PROXIMITY_NOISE_PERIOD);
 			adc_value = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_adc();
 			threshold_high = (g_ps_data->g_ps_calvalue_hi);
 			log("Proximity adc_value=%d, threshold_high=%d\n", adc_value, threshold_high);
@@ -421,6 +408,7 @@ static void proximity_oil_wake_lock_check(void){
 	}
 }
 
+/* Should be called when: 1. light first event get, 2. light sensor on/off */
 static void psensor_onoff_recovery(bool bOn){
 #ifdef RECOVERY_PSENSOR
 	if(g_als_data->freeze_psensor == bOn){
@@ -435,6 +423,8 @@ static void psensor_onoff_recovery(bool bOn){
 			if(g_ps_data->HAL_switch_on == true){
 				log("Close psensor temporary");
 				proximity_turn_onoff(bOn);
+				/* ASUS BSP: add psensor recovery status for re-autok issue */
+				g_ps_data->recovery_mode = true;
 			}
 		}
 	}
@@ -491,11 +481,14 @@ static int proximity_turn_onoff(bool bOn)
 
 		/*check the min for auto calibration*/
 		if(true == g_ps_data->autok){
-			g_ps_data->crosstalk_diff = 0;
+			/* ASUS BSP: add psensor recovery status for re-autok issue */
+			if(g_ps_data->recovery_mode != true){
+				g_ps_data->crosstalk_diff = 0;
+			}
 			/*Stage 1 : check first 6 adc which spend about 50ms~100ms*/
 			ret = proximity_check_minCT();
-			if (ret < 0) {	
-				log("proximity_check_minCT ERROR\n");	
+			if (ret < 0) {
+				log("proximity_check_minCT ERROR\n");
 				g_ps_data->autok = false;
 			}
 		}
@@ -558,9 +551,13 @@ static int proximity_turn_onoff(bool bOn)
 			/*diable the timer*/
 			if(g_ps_data->autok == true){
 				hrtimer_cancel(&g_alsps_timer);
+				log("proximity_hw_turn_onoff: cancel autok timer");
 			}
 
 			proximity_check_period();
+			
+			getnstimeofday(&g_als_data->prox_ts);
+			g_als_data->prox_off_debounce_time_ns = timespec_to_ns(&g_als_data->prox_ts) + g_ALSPS_hw_client->mlsensor_hw->light_hw_get_evt_skip_time_ns();
 		}
 	}
 
@@ -573,8 +570,9 @@ static int proximity_turn_onoff(bool bOn)
 static int proximity_set_threshold(void)
 {
 	int ret = 0;
+#ifndef CONFIG_TMD2755_FLAG
 	int temp = 0;
-
+#endif
 	/* Check Hardware Support First */
 	if(g_ALSPS_hw_client->mpsensor_hw->proximity_hw_set_hi_threshold == NULL) {
 		err("proximity_hw_set_hi_threshold NOT SUPPORT. \n");
@@ -630,6 +628,7 @@ static int proximity_set_threshold(void)
 		err("Proximity read DEFAULT Low Calibration : %d\n", g_ps_data->g_ps_calvalue_lo);
 	}
 	*/
+#ifndef CONFIG_TMD2755_FLAG
 	if(anti_oil_enable == 1){
 		temp = (g_ps_data->g_ps_calvalue_hi - g_ps_data->g_ps_calvalue_lo) / 3;
 		g_ps_data->g_ps_calvalue_lo = temp + g_ps_data->g_ps_calvalue_lo;
@@ -640,6 +639,7 @@ static int proximity_set_threshold(void)
 			log("Proximity final low threshold:%d (offset:%d)\n", g_ps_data->g_ps_calvalue_lo, temp);
 		}
 	}
+#endif
 
 	ret = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_set_hi_threshold(g_ps_data->g_ps_calvalue_hi);
 	if(ret < 0){
@@ -669,19 +669,85 @@ static int proximity_set_threshold(void)
 #ifdef CONFIG_TMD2755_FLAG
 extern void tmd2755_offset_recalibration(void);
 #endif
-
-static void proximity_polling_adc(struct work_struct *work)
+static void oil_polling_work_func(struct work_struct *work)
 {
 	int adc_value = 0;
-#ifdef CONFIG_TMD2755_FLAG
-	int offset = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_offset();
 	int times = 0, max_adc = 0, min_adc = 16383;
 	int adc_tolerance = 15;
 	static int oil_check[16];
 	bool do_recal = false;
 	
 	memset(oil_check, -1, sizeof(oil_check));
+	
+	if(g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_adc != NULL) {
+		mutex_lock(&g_alsps_lock);
+		if(g_ps_data->oil_flag == true && g_ps_data->g_ps_int_status != ALSPS_INT_PS_AWAY){
+			adc_value = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_adc();
+			log("adc = %d", adc_value);
+			if(adc_value < g_ps_data->g_ps_calvalue_hi && adc_value > g_ps_data->g_ps_calvalue_lo){
+				do{
+					oil_check[times] = adc_value;
+					if(adc_value > max_adc){
+						max_adc = adc_value;
+					}
+					if(adc_value < min_adc){
+						min_adc = adc_value;
+					}
+					log(" adc=%d, min=%d, max=%d", adc_value, min_adc, max_adc);
+					if(abs(max_adc - min_adc) > adc_tolerance){
+						log("over_tolerance=%d, adc=%d, min=%d, max=%d", 
+						adc_tolerance, adc_value, min_adc, max_adc);
+						break;
+					}
+					msleep(10);
+					adc_value = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_adc();
+					if(adc_value < g_ps_data->g_ps_calvalue_hi && adc_value > g_ps_data->g_ps_calvalue_lo){
+						times++;
+					}else{
+						log("%d not in range:%d~%d, reset array & leave", 
+							adc_value, g_ps_data->g_ps_calvalue_lo, g_ps_data->g_ps_calvalue_hi);
+						break;
+					}
+				}while(times < 16);
+				if(times == 16){
+					do_recal = true;
+				}else{
+					memset(oil_check, -1, sizeof(oil_check));
+				}
+			}
+		}
+		mutex_unlock(&g_alsps_lock);
+	}
+	if(do_recal == true){
+		log("======Trigger Recalibration========");
+#ifdef CONFIG_TMD2755_FLAG
+		tmd2755_offset_recalibration();
+#else
+		if(g_ps_data->autok == true){
+			hrtimer_cancel(&g_alsps_timer);
+		}
+		g_ps_data->crosstalk_diff = 0;
+		if (proximity_check_minCT() < 0) {
+			log("proximity_check_minCT ERROR\n");
+			g_ps_data->autok = false;
+		}
 #endif
+	}
+	log("Leave");
+	if(g_ps_data->g_ps_int_status != ALSPS_INT_PS_AWAY && g_ps_data->oil_flag){
+		alarm_start_relative(&g_oil_alarm_timer, ms_to_ktime(G_oil_timer));
+		log("Apply alram after %d ms", G_oil_timer);
+	}else{
+		alarm_cancel(&g_oil_alarm_timer);
+		log("Cancel alram");
+	}
+	__pm_relax(g_alsps_oil_wake);
+}
+
+static void proximity_polling_adc(struct work_struct *work)
+{
+	int adc_value = 0;
+
 	/* Check Hardware Support First */
 	if(g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_adc == NULL) {
 		err("proximity_hw_get_adc NOT SUPPORT. \n");
@@ -702,91 +768,35 @@ static void proximity_polling_adc(struct work_struct *work)
 					if(g_ps_data->g_ps_int_status != ALSPS_INT_PS_CLOSE &&
 							(adc_value >= g_ps_data->g_ps_calvalue_hi &&
 							(g_pocket_mode_threshold <= 0 || adc_value < g_pocket_mode_threshold))) {
-#ifdef CONFIG_TMD2755_FLAG
-						log("[Polling] Proximity Detect Object Close. (adc = %d, offset = %d)\n", 
-						adc_value, offset);
-#else
 						log("[Polling] Proximity Detect Object Close. (adc = %d)\n", adc_value);
-#endif
 						psensor_report_abs(PSENSOR_REPORT_PS_CLOSE);
 						g_ps_data->g_ps_int_status = ALSPS_INT_PS_CLOSE;
 					}else if(g_ps_data->g_ps_int_status != ALSPS_INT_PS_AWAY &&
 							adc_value <= g_ps_data->g_ps_calvalue_lo){
-#ifdef CONFIG_TMD2755_FLAG
-						log("[Polling] Proximity Detect Object Away. (adc = %d, offset = %d)\n", 
-						adc_value, offset);
-#else
 						log("[Polling] Proximity Detect Object Away. (adc = %d)\n", adc_value);
-#endif
 						psensor_report_abs(PSENSOR_REPORT_PS_AWAY);
 						g_ps_data->g_ps_int_status = ALSPS_INT_PS_AWAY;
 					}else if(g_ps_data->g_ps_int_status != ALSPS_INT_PS_POCKET &&
 							(g_pocket_mode_threshold > 0 && adc_value >= g_pocket_mode_threshold)){
-#ifdef CONFIG_TMD2755_FLAG
-						log("[Polling] Proximity Detect Object Close. (adc = %d, distance <= 1cm, offset = %d)\n", 
-						adc_value, offset);
-#else
 						log("[Polling] Proximity Detect Object Close. (adc = %d, distance <= 1cm)\n", adc_value);
-#endif
 						psensor_report_abs(PSENSOR_REPORT_PS_POCKET);
 						g_ps_data->g_ps_int_status = ALSPS_INT_PS_POCKET;
 					}
 				}
 			}
-#ifdef CONFIG_TMD2755_FLAG
-			if(g_ps_data->oil_flag == true && g_ps_data->g_ps_int_status != ALSPS_INT_PS_AWAY){
-				if(adc_value < g_ps_data->g_ps_calvalue_hi && adc_value > g_ps_data->g_ps_calvalue_lo){
-					do{
-						oil_check[times] = adc_value;
-						if(adc_value > max_adc){
-							max_adc = adc_value;
-						}
-						if(adc_value < min_adc){
-							min_adc = adc_value;
-						}
-						log(" adc=%d, min=%d, max=%d", adc_value, min_adc, max_adc);
-						if(abs(max_adc - min_adc) > adc_tolerance){
-							log("over_tolerance=%d, adc=%d, min=%d, max=%d", 
-							adc_tolerance, adc_value, min_adc, max_adc);
-							break;
-						}
-						msleep(10);
-						adc_value = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_adc();
-						if(adc_value < g_ps_data->g_ps_calvalue_hi && adc_value > g_ps_data->g_ps_calvalue_lo){
-							times++;
-						}else{
-							log("%d not in range:%d~%d, reset array & leave", 
-								adc_value, g_ps_data->g_ps_calvalue_lo, g_ps_data->g_ps_calvalue_hi);
-							break;
-						}
-					}while(times < 16);
-					if(times == 16){
-						do_recal = true;
-					}else{
-						memset(oil_check, -1, sizeof(oil_check));
-					}
-				}
-			}
-#endif
 			if(g_ps_data->Device_switch_on == true)
 				queue_delayed_work(ALSPS_delay_workqueue, &proximity_polling_adc_work, msecs_to_jiffies(PROXIMITY_POLLING_TIME));
 			else
 				log("[Polling] Proximity polling adc STOP. \n");
 		}
 		mutex_unlock(&g_alsps_lock);
-#ifdef CONFIG_TMD2755_FLAG
-		if(do_recal == true){
-			log("======Trigger Recalibration========");
-			tmd2755_offset_recalibration();
-		}
-#endif
 	}
 }
 
 /* ASUS BSP+++ Clay: dynamic proxmity period due to psensor noise effect */
 static void proximity_check_period(void){
 	/* ASUS BSP Clay: don't do anything when there is no noise at this project */
-	if(PROXIMITY_NOISE_PERIOD == PROXIMITY_PERIOD){
+	if(PROXIMITY_NOISE_PERIOD == PROXIMITY_BASIC_PERIOD){
 		return;
 	}
 
@@ -798,14 +808,14 @@ static void proximity_check_period(void){
 				log("Proximity period set to %d when Light sensor on", g_ps_data->cur_period);
 			}
 		}else{
-			if(g_ps_data->cur_period != PROXIMITY_PERIOD){
-				g_ps_data->cur_period = PROXIMITY_PERIOD;
+			if(g_ps_data->cur_period != PROXIMITY_BASIC_PERIOD){
+				g_ps_data->cur_period = PROXIMITY_BASIC_PERIOD;
 				g_ALSPS_hw_client->mpsensor_hw->proximity_hw_set_period(g_ps_data->cur_period);
 				log("Proximity period recovery to %d when Light sensor off", g_ps_data->cur_period);
 			}
 		}
 	}else{
-		g_ps_data->cur_period = PROXIMITY_PERIOD;
+		g_ps_data->cur_period = PROXIMITY_BASIC_PERIOD;
 	}
 }
 /* ASUS BSP--- */
@@ -934,12 +944,28 @@ static int light_lux_check_psensor_noise(int lux)
 {
 	int index = 0;
 	int lux_temp = 0;
+	struct timespec ts;
+	u64 l_current_time_ns;
+	getnstimeofday(&ts);
+	l_current_time_ns = timespec_to_ns(&ts);
+
 	/* ASUS BSP Clay: when offset_adc = 0, don't do offset behavior */
 	if(g_als_data->offset_adc == 0){
 		return lux;
 	}
 
-	if(g_ps_data->Device_switch_on == true || g_ps_data->HAL_switch_on == true){
+
+	if(g_als_data->g_als_log_first_event){
+		log("Light sensor current_t %llx, rest_t %llx, %llx", l_current_time_ns, 
+		g_als_data->prox_off_debounce_time_ns, g_ALSPS_hw_client->mlsensor_hw->light_hw_get_evt_skip_time_ns());
+
+		if(g_als_data->prox_off_debounce_time_ns > l_current_time_ns){
+			log("Psensor off debounce case!");
+		}
+	}
+
+	if(g_ps_data->Device_switch_on == true || g_ps_data->HAL_switch_on == true 
+	|| g_als_data->prox_off_debounce_time_ns > l_current_time_ns){
 		if(lux <= g_als_data->offset_lux){
 			dbg("psensor on, lux < offset_lux(%d), return 0", lux,  g_als_data->offset_lux);
 			lux = 0;
@@ -981,7 +1007,6 @@ static int light_lux_check_psensor_noise(int lux)
 	return lux;
 }
 
-#ifndef CONFIG_TMD2755_FLAG
 static int light_adc_check_psensor_noise(int adc)
 {
 	int lux = -1;
@@ -999,8 +1024,8 @@ static int light_adc_check_psensor_noise(int adc)
 	}else{/* Do nothing */}
 	return adc;
 }
+
 /* ASUS BSP Clay: shift lux to mitigate psensor noise when psensor on and lux < offset --- */
-#endif
 static int light_suspend_turn_off(bool bOn)
 {
 	int ret=0;
@@ -1074,6 +1099,7 @@ static int light_get_accuracy_gain(void)
 	cal = lsensor_factory_read(LSENSOR_CALIBRATION_FILE);
 
 #if defined LONG_LENGTH_LOGN_IT_NON_PERF || defined LONG_LENGTH_LOGN_IT_PERF || defined CONFIG_TMD2755_FLAG
+	/* AMS chip use 400ms k command, but use 100ms IT time as final setting */
 	if(0 == g_als_data->selection){
 		cal = lsensor_factory_read_50ms(LSENSOR_400MS_CALIBRATION_FILE);
 		log("Light Sensor read calibration 400ms: %d", cal);
@@ -1093,7 +1119,8 @@ static int light_get_accuracy_gain(void)
 	else
 		err("INVALID selection : %d\n", g_als_data->selection);
 
-#ifdef CONFIG_TMD2755_FLAG
+#if defined ASUS_SAKE_PROJECT
+		/* Sake chip, HW ID < PR apply 1.7K to map last lux calculate formula in MP */
 		if(g_ASUS_hwID < HW_REV_MP){
 			cal = cal * LIGHT_CALDATA_TRANSFER_RATIO1 / LIGHT_CALDATA_TRANSFER_RATIO2;
 			log("HW_ID < MP, new cal=%d", cal);
@@ -1123,19 +1150,29 @@ static void light_polling_lux(struct work_struct *work)
 	if(g_ALSPS_hw_client->mlsensor_hw->light_hw_get_adc == NULL) {
 		err("light_hw_get_adc NOT SUPPORT. \n");
 	}
-
 mutex_lock(&g_alsps_lock);
 
 	if(g_als_data->HAL_switch_on == true) {
 		/* Light Sensor Report the first real event*/
 		adc = g_ALSPS_hw_client->mlsensor_hw->light_hw_get_adc();
+
 #ifdef CONFIG_TMD2755_FLAG
-		adc = g_ALSPS_hw_client->mlsensor_hw->light_hw_get_lux();
+		/* need polling thread to cover first event only when behavior is 0 lux */
+		if (adc > 0 && g_tmd2755_status_param.log_first_evt == true){
+			cancel_delayed_work(&light_polling_lux_work);
+			queue_delayed_work(ALSPS_delay_workqueue, &light_polling_lux_work, msecs_to_jiffies(400));
+			log("skip polling behavior since first event can be reported by chip ist");
+			g_tmd2755_status_param.log_first_evt = false;
+mutex_unlock(&g_alsps_lock);
+			return;
+		}
 #endif
 		if ((0 == adc) && (g_als_data->g_als_retry_count < limit_count)) {
 			g_als_data->g_als_retry_count++;
 			if(g_als_data->g_als_retry_count == limit_count){
-				log("[Polling1] Light Sensor retry for get adc\n");
+				lux = light_get_lux(adc) * g_als_data->dynamic_sensitive;
+				lsensor_report_lux(lux);
+				log("[Polling1] Light Sensor retry for get adc, report lux=%d\n", lux);
 			}
 			log_count = limit_count;
 		}else if (adc < 0){
@@ -1146,13 +1183,8 @@ mutex_lock(&g_alsps_lock);
 			lux = light_lux_check_psensor_noise(lux);
 			/* ASUS BSP Clay: shift lux to mitigate psensor noise when psensor on and lux < offset --- */
 			if(ALS_check_event_rest_time(lux)==1){
-				psensor_onoff_recovery(true);
 				if(g_als_last_lux != lux){
-					if(lux < 100 && (log_count >= (limit_count/2))){
-						log("[Polling2] Light Sensor Report lux : %d (adc = %d), last_lux=%d, count=%d, poll_t=%u\n"
-							, lux, adc, g_als_last_lux, g_als_data->g_als_retry_count, polling_time);
-						log_count = 0;
-					}else if (log_count >= limit_count){
+					if((lux < 100 && (log_count >= (limit_count/2))) || log_count >= limit_count){
 						log("[Polling2] Light Sensor Report lux : %d (adc = %d), last_lux=%d, count=%d, poll_t=%u\n"
 							, lux, adc, g_als_last_lux, g_als_data->g_als_retry_count, polling_time);
 						log_count = 0;
@@ -1160,12 +1192,12 @@ mutex_lock(&g_alsps_lock);
 						log_count++;
 					}
 				}
-				if((g_als_last_lux <= 1000 && lux > 1000) ||
-					(g_als_last_lux > 1000 && lux <= 1000)){
+				if((g_als_last_lux <= 1000 && lux > 1000) || (g_als_last_lux > 1000 && lux <= 1000)){
 					ALS_dynamic_ctl_check(lux);
 				}
 				g_als_last_lux = lux;
 			}
+			g_als_data->g_als_retry_count = limit_count;
 		}
 		/* dynamic sensitive case */
 		switch(g_als_data->dynamic_IT){
@@ -1175,7 +1207,11 @@ mutex_lock(&g_alsps_lock);
 				break;
 			case CS_IT_50MS:
 				limit_count = 5;
-				polling_time = 400;
+				if(g_als_data->g_als_retry_count >= limit_count){
+					polling_time = 400;
+				}else{
+					polling_time = 50;
+				}
 				break;
 			case CS_IT_100MS:
 				limit_count = 10;
@@ -1326,7 +1362,6 @@ static int mproximity_store_calibration_inf(int calvalue)
 	return 0;
 }
 
-#ifdef CONFIG_TMD2755_FLAG
 static int mproximity_show_calibration_offset(void)
 {
 	int calvalue;
@@ -1334,7 +1369,6 @@ static int mproximity_show_calibration_offset(void)
 	dbg("Proximity show Offset Calibration: %d\n", calvalue);
 	return calvalue;
 }
-
 static int mproximity_store_calibration_offset(int calvalue)
 {
 	if(calvalue <= 0) {
@@ -1343,7 +1377,6 @@ static int mproximity_store_calibration_offset(int calvalue)
 	}
 	log("Proximity store Offset Calibration: %d\n", calvalue);
 	psensor_factory_write_inf(calvalue, PSENSOR_OFFSET_CALIBRATION_FILE);
-	
 	return 0;
 }
 
@@ -1361,10 +1394,25 @@ static int mproximity_store_oil_flag(int flag)
 	}
 	log("Proximity store oil flag: %d\n", flag);
 	g_ps_data->oil_flag = flag;
-	proximity_oil_wake_lock_check();
 	return 0;
 }
-#endif
+
+static int mproximity_show_oil_timer(void)
+{
+	log("oil time = %d ms", G_oil_timer);
+	return G_oil_timer;
+}
+
+static int mproximity_store_oil_timer(int time)
+{
+	if(time < 0) {
+		err("Proximity store oil time with NON-POSITIVE value. (%d) \n", time);
+		return -EINVAL;
+	}
+	log("Proximity store oil time: %d ms\n", G_oil_timer);
+	G_oil_timer = time;
+	return 0;
+}
 
 static int mproximity_show_adc(void)
 {
@@ -1384,11 +1432,9 @@ static int mproximity_show_adc(void)
 			err("proximity_hw_turn_onoff(true) ERROR\n");
 			return ret;
 		}
-		msleep(PROXIMITY_TURNON_DELAY_TIME);
+		msleep(PROXIMITY_NOISE_PERIOD);
 	}
-#ifdef CONFIG_TMD2755_FLAG
-	msleep(300);
-#endif
+	msleep(PROXIMITY_CALIBRATION_DELAY);
 
 	adc = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_adc();
 	dbg("mproximity_show_adc : %d \n", adc);
@@ -1413,6 +1459,7 @@ static int mlight_show_calibration(void)
 
 	calvalue = lsensor_factory_read(LSENSOR_CALIBRATION_FILE);
 #if defined LONG_LENGTH_LOGN_IT_NON_PERF || defined LONG_LENGTH_LOGN_IT_PERF || defined CONFIG_TMD2755_FLAG
+	/* AMS chip use 400ms k command, but use 100ms IT time as final setting */
 	if(0 == g_als_data->selection){
 		calvalue = lsensor_factory_read_50ms(LSENSOR_400MS_CALIBRATION_FILE);
 		log("Light Sensor read calibration(show) 400ms: %d", calvalue);
@@ -1450,6 +1497,7 @@ static int mlight_store_calibration(int calvalue)
 	lsensor_factory_write(calvalue, LSENSOR_CALIBRATION_FILE);
 
 #if defined LONG_LENGTH_LOGN_IT_NON_PERF || defined LONG_LENGTH_LOGN_IT_PERF || defined CONFIG_TMD2755_FLAG
+	/* AMS chip use 400ms k command, but use 100ms IT time as final setting */
 	if(0 == g_als_data->selection){
 		lsensor_factory_write_50ms(calvalue, LSENSOR_400MS_CALIBRATION_FILE);
 		log("Light Sensor write calibration 400ms: %d", calvalue);
@@ -1481,9 +1529,7 @@ static int mlight_show_adc(void)
 {
 
 	int adc = 0; 
-#ifndef CONFIG_TMD2755_FLAG
 	int count = 0;
-#endif
 	if(g_ALSPS_hw_client->mlsensor_hw->light_hw_get_adc == NULL) {
 		err("light_hw_get_adc NOT SUPPORT. \n");
 		return -EINVAL;
@@ -1492,19 +1538,9 @@ static int mlight_show_adc(void)
 	mutex_lock(&g_alsps_lock);
 	if (!g_als_data->Device_switch_on) {
 		light_turn_onoff(true);
-
-#if defined LONG_LENGTH_LOGN_IT_NON_PERF || defined LONG_LENGTH_LOGN_IT_PERF || defined CONFIG_TMD2755_FLAG
-		msleep(LIGHT_TURNON_DELAY_TIME*50);
-#else
-		msleep(LIGHT_TURNON_DELAY_TIME*18);
-#endif
-
+		msleep(LIGHT_TURNON_DELAY_TIME);
 	}
-	
-#ifdef CONFIG_TMD2755_FLAG
-	adc = g_ALSPS_hw_client->mlsensor_hw->light_hw_get_adc();
-	adc = g_ALSPS_hw_client->mlsensor_hw->light_hw_get_lux();
-#else
+
 	adc = g_ALSPS_hw_client->mlsensor_hw->light_hw_get_adc();
 	log("adc : %d, sensitive=%d\n", adc, g_als_data->dynamic_sensitive);
 	for(count=0; count < 10; count++){
@@ -1521,7 +1557,6 @@ static int mlight_show_adc(void)
 	/* ASUS BSP Clay: shift lux to mitigate psensor noise when psensor on and lux < offset +++ */
 	adc = light_adc_check_psensor_noise(adc);
 	/* ASUS BSP Clay: shift lux to mitigate psensor noise when psensor on and lux < offset --- */
-#endif
 	log("mlight_show_adc : %d \n", adc);
 	if (!g_als_data->HAL_switch_on) {
 		light_turn_onoff(false);
@@ -1548,12 +1583,12 @@ static psensor_ATTR_Calibration mpsensor_ATTR_Calibration = {
 	.proximity_store_calibration_lo = mproximity_store_calibration_lo,
 	.proximity_show_calibration_inf = mproximity_show_calibration_inf,
 	.proximity_store_calibration_inf = mproximity_store_calibration_inf,
-#ifdef CONFIG_TMD2755_FLAG
 	.proximity_show_calibration_offset = mproximity_show_calibration_offset,
 	.proximity_store_calibration_offset = mproximity_store_calibration_offset,
 	.proximity_show_oil_flag = mproximity_show_oil_flag,
 	.proximity_store_oil_flag = mproximity_store_oil_flag,
-#endif
+	.proximity_show_oil_timer = mproximity_show_oil_timer,
+	.proximity_store_oil_timer = mproximity_store_oil_timer,
 	.proximity_show_adc = mproximity_show_adc,
 };
 
@@ -1733,17 +1768,19 @@ static bool mproximity_show_switch_onoff(void)
 extern bool g_Psensor_load_cal_status;
 static int mproximity_store_switch_onoff(bool bOn)
 {
-#ifdef CONFIG_TMD2755_FLAG
-	if(false == g_tmd2755_probe_status){
+	if(false == g_tmd2755_status_param.probe_status){
 		log("tmd2755 probe fail");
 		return 0;
 	}
-#endif
+
 	mutex_lock(&g_alsps_lock);
 	log("Proximity switch = %d.\n", bOn);
 
 	if ((g_ps_data->Device_switch_on != bOn)){
 		if (bOn == true)	{
+			/* ASUS BSP: add psensor recovery status for re-autok issue */
+			g_ps_data->recovery_mode = false;
+
 			/* Turn on Proxomity */
 			g_ps_data->HAL_switch_on = true;
 			if(g_Psensor_load_cal_status){
@@ -1756,9 +1793,6 @@ static int mproximity_store_switch_onoff(bool bOn)
 			/* Turn off Proxomity */
 			g_ps_data->HAL_switch_on = false;
 			proximity_turn_onoff(false);
-#ifdef CONFIG_TMD2755_FLAG
-			proximity_oil_wake_lock_check();
-#endif
 			log("Proximity Report final Away\n");
 			g_ps_data->g_ps_int_status = ALSPS_INT_PS_INIT;
 			psensor_report_abs(-1);
@@ -1766,6 +1800,7 @@ static int mproximity_store_switch_onoff(bool bOn)
 		}
 	}else{
 		log("Proximity is already %s", bOn?"ON":"OFF");
+		g_ps_data->HAL_switch_on = false;
 	}
 	mutex_unlock(&g_alsps_lock);
 
@@ -1779,14 +1814,13 @@ static bool mlight_show_switch_onoff(void)
 
 static int mlight_store_switch_onoff(bool bOn)
 {
-#ifdef CONFIG_TMD2755_FLAG
-	if(false == g_tmd2755_probe_status){
+	if(false == g_tmd2755_status_param.probe_status){
 		log("tmd2755 probe fail");
 		return 0;
 	}
-#endif
+
 	mutex_lock(&g_alsps_lock);
-	dbg("Light Sensor switch1 = %d.\n", bOn);
+	dbg("Light Sensor switch1 = %d, freeze_p=%d\n", bOn, g_als_data->freeze_psensor);
 	if((g_als_data->Device_switch_on != bOn)){
 		if(bOn == true){
 			/* Turn on Light Sensor */
@@ -1799,11 +1833,7 @@ static int mlight_store_switch_onoff(bool bOn)
 			/*light sensor polling the first real event after delayed time. */
 			g_als_data->g_als_retry_count = 0;
 			cancel_delayed_work(&light_polling_lux_work);
-#ifdef CONFIG_TMD2755_FLAG
-			queue_delayed_work(ALSPS_delay_workqueue, &light_polling_lux_work, msecs_to_jiffies(LIGHT_POLLING_START_DELAY_TIME));
-#else
 			queue_delayed_work(ALSPS_delay_workqueue, &light_polling_lux_work, msecs_to_jiffies(LIGHT_TURNON_DELAY_TIME));
-#endif
 		}else{
 			/* Turn off Light Sensor */
 			g_als_data->HAL_switch_on = false;
@@ -1839,17 +1869,11 @@ static int mlight_show_lux(void)
 	
 	msleep(LIGHT_TURNON_DELAY_TIME);
 
-	
-#ifdef CONFIG_TMD2755_FLAG
-	if(false == g_tmd2755_probe_status){
+	if(false == g_tmd2755_status_param.probe_status){
 		log("tmd2755 probe fail");
 		return -1;
 	}
 	adc = g_ALSPS_hw_client->mlsensor_hw->light_hw_get_adc();
-	adc = g_ALSPS_hw_client->mlsensor_hw->light_hw_get_lux();
-#else
-	adc = g_ALSPS_hw_client->mlsensor_hw->light_hw_get_adc();
-#endif
 
 	lux = light_get_lux(adc) * g_als_data->dynamic_sensitive; //if IT= 100, adc should *4 to simulate lux value based on 400 IT time
 
@@ -1883,7 +1907,6 @@ static lsensor_ATTR_HAL mlsensor_ATTR_HAL = {
 /*********************/
 /*Extension Function*/
 /********************/
-#ifdef CONFIG_TMD2755_FLAG
 static ssize_t mproximity_show_allreg(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	log("==================Pshow_allreg===========");
@@ -1893,17 +1916,6 @@ static ssize_t mproximity_show_allreg(struct device *dev, struct device_attribut
 	}
 	return g_ALSPS_hw_client->ALSPS_hw_show_allreg(dev, attr, buf);
 }
-#else
-static bool mproximity_show_allreg(void)
-{
-	if(g_ALSPS_hw_client->ALSPS_hw_show_allreg == NULL) {
-		err("IRsensor_hw_show_allreg NOT SUPPORT. \n");
-		return false;
-	}
-	g_ALSPS_hw_client->ALSPS_hw_show_allreg();
-	return true;
-}
-#endif
 
 static bool mproximity_show_polling_mode(void)
 {
@@ -2041,8 +2053,7 @@ static int mproximity_store_load_calibration_data(void)
 	}else{
 		err("Proximity read DEFAULT Low Calibration : %d\n", g_ps_data->g_ps_factory_cal_lo);
 	}
-	
-#ifdef CONFIG_TMD2755_FLAG
+
 	ret = psensor_factory_read_inf(PSENSOR_OFFSET_CALIBRATION_FILE);
 	if(ret >= 0) {
 		g_ps_data->g_ps_calvalue_offset= ret;
@@ -2051,6 +2062,10 @@ static int mproximity_store_load_calibration_data(void)
 	}else{
 		err("Proximity read DEFAULT Offset Calibration : %d\n", g_ps_data->g_ps_calvalue_offset);
 	}
+#ifdef CONFIG_TMD2755_FLAG
+		if(g_ALSPS_hw_client->mpsensor_hw->proximity_hw_set_offset){
+			g_ALSPS_hw_client->mpsensor_hw->proximity_hw_set_offset(g_ps_data->g_ps_calvalue_offset);
+		}
 #endif
 
 	log("Proximity load factory Calibration done!\n");
@@ -2078,7 +2093,14 @@ static int mproximity_store_anti_oil_enable(bool enable)
 	return ret;
 }
 
-#ifdef CONFIG_TMD2755_FLAG
+static ssize_t mproximity_chip_cal_en(bool flag){
+	log("cal mproximity_chip_recal = %d");
+	if(g_ALSPS_hw_client->mpsensor_hw->proximity_hw_chip_cal_en){
+		g_ALSPS_hw_client->mpsensor_hw->proximity_hw_chip_cal_en(flag);
+	}
+	return true;
+}
+
 static ssize_t mlight_show_allreg(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	log("==================Lshow_allreg===========");
@@ -2089,37 +2111,16 @@ static ssize_t mlight_show_allreg(struct device *dev, struct device_attribute *a
 	return g_ALSPS_hw_client->ALSPS_hw_show_allreg(dev, attr, buf);
 }
 
-static ssize_t mproximity_chip_cal_en(bool flag){
-	log("cal mproximity_chip_recal = %d");
-	g_ALSPS_hw_client->mpsensor_hw->proximity_hw_chip_cal_en(flag);
-	return true;
-}
-#else
-static bool mlight_show_allreg(void)
-{
-	if(g_ALSPS_hw_client->ALSPS_hw_show_allreg == NULL) {
-		err("IRsensor_hw_show_allreg NOT SUPPORT. \n");
-		return false;
-	}
-	g_ALSPS_hw_client->ALSPS_hw_show_allreg();
-	return true;
-}
-#endif
 static int mproximity_store_pocket_en(bool flag){
-#ifdef CONFIG_TMD2755_FLAG
-	int thresh =  0;
-#endif
 	g_ps_data->pocket_mode = flag;
 	if(g_ps_data->pocket_mode){
-		g_pocket_mode_threshold = g_pocket_mode_threshold_orig * 
-		PROXIMITY_POCKET_MODE_RATIO / 100;
+		g_pocket_mode_threshold = g_pocket_mode_threshold_orig * PROXIMITY_POCKET_MODE_RATIO / 100;
 	}else{
 		g_pocket_mode_threshold = g_pocket_mode_threshold_orig;
 	}
 #ifdef CONFIG_TMD2755_FLAG
-	thresh = g_pocket_mode_threshold_orig * 
-		PROXIMITY_POCKET_MODE_OFFSET_RATIO / 100 / PROXIMITY_ADC_PER_OFFSET;
-	g_ALSPS_hw_client->mpsensor_hw->proximity_hw_set_offset_limit(flag, thresh);
+	g_ALSPS_hw_client->mpsensor_hw->proximity_hw_set_offset_limit(flag, 
+	g_pocket_mode_threshold_orig * PROXIMITY_POCKET_MODE_OFFSET_RATIO / 100 / PROXIMITY_ADC_PER_OFFSET);
 #endif
 	log("cal mproximity_pocket_en = %d, pocket_thresh: %d", flag, g_pocket_mode_threshold);
 	return 0;
@@ -2226,9 +2227,7 @@ static psensor_ATTR_Extension mpsensor_ATTR_Extension = {
 	/*For enable anti-oil workaround*/
 	.proximity_show_anti_oil_enable = mproximity_show_anti_oil_enable,
 	.proximity_store_anti_oil_enable = mproximity_store_anti_oil_enable,
-#ifdef CONFIG_TMD2755_FLAG
 	.proximity_chip_cal_en = mproximity_chip_cal_en,
-#endif
 	.proximity_store_pocket_en = mproximity_store_pocket_en,
 };
 
@@ -2270,10 +2269,6 @@ static lsensor_ATTR mlsensor_ATTR = {
 void proximity_work(int state)
 {
 	int adc = 0;
-	
-#ifdef CONFIG_TMD2755_FLAG
-	int offset = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_offset();
-#endif
 	//int audio_mode = 0;
 
 	/* Get Proximity adc value */
@@ -2288,50 +2283,32 @@ void proximity_work(int state)
 	{
 		/* Check proximity close or away. */
 		if(ALSPS_INT_PS_AWAY == state) {
-#ifdef CONFIG_TMD2755_FLAG
-			if(g_ps_data->g_ps_int_status != ALSPS_INT_PS_AWAY){
-				log("[ISR] Proximity Detect Object Away. (adc = %d, offset = %d)\n", adc, offset);
-			}
-			psensor_report_abs(PSENSOR_REPORT_PS_AWAY);
-			g_ps_data->g_ps_int_status = ALSPS_INT_PS_AWAY;
-			proximity_oil_wake_lock_check();
-#else
 			log("[ISR] Proximity Detect Object Away. (adc = %d)\n", adc);
 			psensor_report_abs(PSENSOR_REPORT_PS_AWAY);
 			g_ps_data->g_ps_int_status = ALSPS_INT_PS_AWAY;
-#endif
 			g_ps_data->event_counter++;	/* --- For stress test debug --- */
+			if(g_ps_data->oil_flag){
+				alarm_cancel(&g_oil_alarm_timer);
+			}
 			//audio_mode = get_audiomode();
 			//if (0 == audio_mode || 2 == audio_mode || 3 == audio_mode) {
 			//	ftxxxx_disable_touch(false);
 			//}
 		} else if (ALSPS_INT_PS_CLOSE == state) {
 			if(g_pocket_mode_threshold > 0 && adc >= g_pocket_mode_threshold){
-#ifdef CONFIG_TMD2755_FLAG
-				if(g_ps_data->g_ps_int_status != ALSPS_INT_PS_POCKET){
-					log("[ISR] Proximity Detect Object Close. (adc = %d, distance <= 1cm, offset = %d)\n", adc, offset);
-				}
-#else
 				log("[ISR] Proximity Detect Object Close. (adc = %d, distance <= 1cm)\n", adc);
-#endif
-
 				psensor_report_abs(PSENSOR_REPORT_PS_POCKET);
 				g_ps_data->g_ps_int_status = ALSPS_INT_PS_POCKET;
 			}else{
-#ifdef CONFIG_TMD2755_FLAG
-				if(g_ps_data->g_ps_int_status != ALSPS_INT_PS_CLOSE){
-					log("[ISR] Proximity Detect Object Close. (adc = %d, offset = %d)\n", 
-					adc, offset);
-				}
-				psensor_report_abs(PSENSOR_REPORT_PS_CLOSE);
-				g_ps_data->g_ps_int_status = ALSPS_INT_PS_CLOSE;
-				proximity_oil_wake_lock_check();
-#else
 				log("[ISR] Proximity Detect Object Close. (adc = %d)\n", adc);
 				psensor_report_abs(PSENSOR_REPORT_PS_CLOSE);
 				g_ps_data->g_ps_int_status = ALSPS_INT_PS_CLOSE;
-#endif
 			}
+			if(g_ps_data->oil_flag){
+				alarm_start_relative(&g_oil_alarm_timer, ms_to_ktime(G_oil_timer));
+				log("Apply alarm after %d ms", G_oil_timer);
+			}
+
 			g_ps_data->event_counter++;	/* --- For stress test debug --- */
 			//audio_mode = get_audiomode();
 			//if (2 == audio_mode || 3 == audio_mode) {
@@ -2414,9 +2391,6 @@ void light_work(void)
 		//log("[ISR] Light Sensor Set High/Low Threshold. (Hi/Low:%d/%d)\n", high_threshold, low_threshold);
 		
 		/* Light Sensor Report input event*/
-#ifdef CONFIG_TMD2755_FLAG
-		adc = g_ALSPS_hw_client->mlsensor_hw->light_hw_get_lux();
-#endif
 		lux = light_get_lux(adc);
 		if(lux > 100){
 			light_log_threshold = LIGHT_LOG_THRESHOLD;
@@ -2437,7 +2411,7 @@ void light_work(void)
 
 		if(g_als_data->g_als_log_first_event){
 			/* report directly */
-			log("[ISR] Light Sensor First Report lux : %d (adc = %d), IT_id=%d\n", lux, adc, g_als_data->dynamic_IT);
+			log("[ISR] Light Sensor Report lux First : %d (adc = %d), IT_id=%d\n", lux, adc, g_als_data->dynamic_IT);
 			lsensor_report_lux(lux);
 			g_als_data->event_counter++;	/* --- For stress test debug --- */
 			g_als_last_lux = lux;
@@ -2469,10 +2443,15 @@ static int ALSPS_IST_LOG_COUNT=0;
 static int ALSPS_IST_LOG_LIMIT=1000;
 static void ALSPS_ist(struct work_struct *work)
 {
-#ifndef CONFIG_TMD2755_FLAG
 	int alsps_int_ps, alsps_int_als;
-#endif
-	
+
+	/* Wait the i2c driver resume finish */
+	if(g_alsps_power_status == ALSPS_SUSPEND){
+		queue_delayed_work(ALSPS_delay_workqueue, &ALSPS_ist_work, msecs_to_jiffies(WAIT_I2C_DELAY));
+		dbg("Wait i2c driver ready(%d ms)", WAIT_I2C_DELAY);
+		return;
+	}
+
 mutex_lock(&g_alsps_lock);
 	if(g_als_data->Device_switch_on == false && g_ps_data->Device_switch_on == false) {
 		if(ALSPS_IST_LOG_COUNT==0){
@@ -2492,28 +2471,15 @@ mutex_lock(&g_alsps_lock);
 		goto ist_err;
 	}
 
-	/* Wait the i2c driver resume finish */
-	if(g_alsps_power_status == ALSPS_SUSPEND){
-		mdelay(WAIT_I2C_DELAY);
-		dbg("Wait i2c driver ready(%d ms)", WAIT_I2C_DELAY);
-	}
-
 	dbg("ALSPS call ALSPS_hw_get_interrupt +++ \n");
-	
-#ifndef CONFIG_TMD2755_FLAG
+
 	ALSPS_SENSOR_INT = g_ALSPS_hw_client->ALSPS_hw_get_interrupt();
 	if(ALSPS_SENSOR_INT <0){
 //		err("ALSPS_hw_get_interrupt ERROR\n");
 		goto ist_err;
 	}
-#else
-	/* Read INT_FLAG will clean the interrupt */
-	g_ALSPS_hw_client->ALSPS_hw_get_interrupt();
-#endif
 	
 	dbg("ALSPS call ALSPS_hw_get_interrupt --- \n");
-#ifndef CONFIG_TMD2755_FLAG
-
 	// Check Proximity Interrupt
 	alsps_int_ps = ALSPS_SENSOR_INT&ALSPS_INT_PS_MASK;
 	if(alsps_int_ps == ALSPS_INT_PS_CLOSE || alsps_int_ps == ALSPS_INT_PS_AWAY) 
@@ -2539,7 +2505,6 @@ mutex_lock(&g_alsps_lock);
 
 		light_work();
 	}
-#endif
 	dbg("ALSPS ist --- \n");
 ist_err:	
 	__pm_relax(g_alsps_wake_lock);
@@ -2549,7 +2514,6 @@ mutex_unlock(&g_alsps_lock);
 
 }
 
-#ifndef CONFIG_TMD2755_FLAG
 static void ALSPS_irq_handler(void)
 {
 	dbg("[IRQ] Disable irq !! \n");
@@ -2561,7 +2525,7 @@ static void ALSPS_irq_handler(void)
 	}
 
 	/*Queue work will enbale IRQ and unlock wake_lock*/
-	queue_work(ALSPS_workqueue, &ALSPS_ist_work);
+	queue_delayed_work(ALSPS_delay_workqueue, &ALSPS_ist_work, msecs_to_jiffies(WAIT_I2C_DELAY));
 	__pm_stay_awake(g_alsps_wake_lock);
 	return;
 irq_err:
@@ -2572,7 +2536,6 @@ irq_err:
 static ALSPSsensor_GPIO mALSPSsensor_GPIO = {
 	.ALSPSsensor_isr = ALSPS_irq_handler,
 };
-#endif
 
 /*============================
  *|| For ALSPS check onoff ||
@@ -2601,7 +2564,7 @@ static int ALS_check_event_rest_time(int lux){
 		if(l_current_time_ns > g_als_data->evt_skip_time_ns){
 			log("Light sensor report Lux=%d,  current_t %llx, rest_t %llx", lux, l_current_time_ns, g_als_data->evt_skip_time_ns);
 			g_als_data->evt_skip_time_ns = 0;
-			g_als_data->ts.tv_nsec = 0;
+			g_als_data->IT_change_ts.tv_nsec = 0;
 			lsensor_report_lux(lux);
 			g_als_data->event_counter++;	/* --- For stress test debug --- */
 			return 1;
@@ -2620,6 +2583,7 @@ static int ALS_check_event_rest_time(int lux){
  *|| For ALS dynamic control check ||
  *===================================
  */
+//Change IT time if chip needs to change IT time to cover lux report range
 static int ALS_dynamic_ctl_check(int lux){
 	if(g_ALSPS_hw_client->mlsensor_hw->light_hw_dynamic_check(lux)==1){
 		g_als_data->dynamic_sensitive = g_ALSPS_hw_client->mlsensor_hw->light_hw_get_current_sensitive();
@@ -2640,12 +2604,12 @@ static int ALS_dynamic_ctl_check(int lux){
 		
 		//assign rest time enable
 		//&g_als_data->ts = ktime_to_timespec(ktime_get_boottime());//
-		getnstimeofday(&g_als_data->ts); 
-		g_als_data->evt_skip_time_ns = timespec_to_ns(&g_als_data->ts) + g_ALSPS_hw_client->mlsensor_hw->light_hw_get_evt_skip_time_ns();
+		getnstimeofday(&g_als_data->IT_change_ts);
+		g_als_data->evt_skip_time_ns = timespec_to_ns(&g_als_data->IT_change_ts) + g_ALSPS_hw_client->mlsensor_hw->light_hw_get_evt_skip_time_ns();
 		log("Light sensor: sense=%d, IT=%d, skip_t=%llx, cur_t=%llx, rest_t %llx", 
 			g_als_data->dynamic_sensitive, g_als_data->dynamic_IT,
 			g_ALSPS_hw_client->mlsensor_hw->light_hw_get_evt_skip_time_ns(), 
-			timespec_to_ns(&g_als_data->ts), g_als_data->evt_skip_time_ns);
+			timespec_to_ns(&g_als_data->IT_change_ts), g_als_data->evt_skip_time_ns);
 		return 1;
 	}else
 		return 0;
@@ -2661,13 +2625,11 @@ bool proximityStatus(void)
 	bool status = false;
 	int ret=0;
 	int threshold_high = 0;
-	
-#ifdef CONFIG_TMD2755_FLAG
-		if(false == g_tmd2755_probe_status){
+
+		if(false == g_tmd2755_status_param.probe_status){
 			log("tmd2755 probe fail");
 			return false;
 		}
-#endif
 
 	__pm_stay_awake(g_alsps_wake_lock);
 	/* check probe status */
@@ -2678,18 +2640,9 @@ bool proximityStatus(void)
 
 	/*Set Proximity Threshold(reset to factory)*/
 	if(g_ps_data->Device_switch_on == false){
-#if 0
-		ret = proximity_set_threshold();
-		if (ret < 0) {	
-			err("proximity_set_threshold ERROR\n");
-			goto ERROR_HANDLE;
+		if(g_ALSPS_hw_client->mpsensor_hw->proximity_hw_chip_cal_en){
+			g_ALSPS_hw_client->mpsensor_hw->proximity_hw_chip_cal_en(false);
 		}
-#endif
-		
-#ifdef CONFIG_TMD2755_FLAG
-		g_ALSPS_hw_client->mpsensor_hw->proximity_hw_chip_cal_en(false);
-#endif
-
 		ret = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_turn_onoff(true);
 		if(ret < 0){
 			err("proximity_hw_turn_onoff(true) ERROR\n");
@@ -2697,27 +2650,22 @@ bool proximityStatus(void)
 		}
 	}
 
-	msleep(PROXIMITY_TURNON_DELAY_TIME);
+	msleep(PROXIMITY_NOISE_PERIOD);
 
 	adc_value = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_adc();
 	
-#ifdef CONFIG_TMD2755_FLAG
-	threshold_high = g_ps_data->g_ps_factory_cal_hi;
-	if (adc_value >= threshold_high) {
-		status = true;
-	}else{ 
-		status = false;
+	/* use vendor's autok */
+	if(g_ps_data->autok == false){
+		threshold_high = g_ps_data->g_ps_factory_cal_hi;
+	}else{
+		//ASUS BSP Clay +++: use previous autok crosstalk
+		if(g_ps_data->crosstalk_diff > g_ps_data->g_ps_autok_max){
+			threshold_high = g_ps_data->g_ps_factory_cal_hi + g_ps_data->g_ps_autok_max;
+		}else {
+			threshold_high = g_ps_data->g_ps_factory_cal_hi + g_ps_data->crosstalk_diff;
+		}
+		//ASUS BSP Clay ---
 	}
-	log("proximityStatus : %s , (adc, hi_cal, prev_offset)=(%d, %d, %d)\n", 
-		status?"Close":"Away", adc_value, threshold_high, g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_offset());
-#else
-	//ASUS BSP Clay +++: use previous autok crosstalk
-	if(g_ps_data->crosstalk_diff > g_ps_data->g_ps_autok_max){
-		threshold_high = g_ps_data->g_ps_factory_cal_hi + g_ps_data->g_ps_autok_max;
-	}else {
-		threshold_high = g_ps_data->g_ps_factory_cal_hi + g_ps_data->crosstalk_diff;
-	}
-	//ASUS BSP Clay ---
 
 	if (adc_value >= threshold_high) {
 		status = true;
@@ -2726,12 +2674,11 @@ bool proximityStatus(void)
 	}
 	log("proximityStatus : %s , (adc, hi_cal+prev_autoK)=(%d, %d)\n", 
 		status?"Close":"Away", adc_value, threshold_high);
-#endif
 
 	if(g_ps_data->Device_switch_on == false){
-#ifdef CONFIG_TMD2755_FLAG
-		g_ALSPS_hw_client->mpsensor_hw->proximity_hw_chip_cal_en(true);
-#endif
+		if(g_ALSPS_hw_client->mpsensor_hw->proximity_hw_chip_cal_en){
+			g_ALSPS_hw_client->mpsensor_hw->proximity_hw_chip_cal_en(true);
+		}
 		ret = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_turn_onoff(false);
 		if(ret < 0){
 			err("proximity_hw_turn_onoff(false) ERROR\n");
@@ -2744,7 +2691,7 @@ ERROR_HANDLE:
 	__pm_relax(g_alsps_wake_lock);
 	return status;
 }
-EXPORT_SYMBOL(proximityStatus);
+EXPORT_SYMBOL_GPL(proximityStatus);
 
 /*===========================
  *|| Proximity Auto Calibration Part ||
@@ -2769,32 +2716,36 @@ static int proximity_check_minCT(void)
 	*/
 
 	log("Proximity INF Calibration : %d\n", g_ps_data->g_ps_calvalue_inf);
-
-	/* ASUS BSP+++ Clay: dynamic proxmity period due to psensor noise effect */
-	if(g_ps_data->cur_period == PROXIMITY_NOISE_PERIOD &&
-			PROXIMITY_NOISE_PERIOD != PROXIMITY_PERIOD){
-		count = PROXIMITY_NOISE_AUTOK_COUNT;
-		delay = PROXIMITY_NOISE_AUTOK_DELAY;
+	if(g_ps_data->recovery_mode == true){
+		log("apply previous crosstalk diff when psensor is on recovery mode, crosstalk = %d", g_ps_data->crosstalk_diff);
+		crosstalk_diff = g_ps_data->crosstalk_diff;
 	}else{
-		count = PROXIMITY_AUTOK_COUNT;
-		delay = PROXIMITY_AUTOK_DELAY;
-	}
-	log("count=%d, delay=%d, period=%d\n", count, delay, g_ps_data->cur_period);
-	/* ASUS BSP--- */
-	
-	/*update the min crosstalk value*/
-	for(round=0; round<count; round++){	
-		mdelay(delay);
-		adc_value = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_adc();
-		log("proximity auto calibration adc : %d\n", adc_value);
-		if(adc_value < crosstalk_min ){
-			crosstalk_min = adc_value;
-			log("Update the min for crosstalk : %d\n", crosstalk_min);
+		/* ASUS BSP+++ Clay: dynamic proxmity period due to psensor noise effect */
+		if(g_ps_data->cur_period == PROXIMITY_NOISE_PERIOD &&
+				PROXIMITY_NOISE_PERIOD != PROXIMITY_BASIC_PERIOD){
+			count = PROXIMITY_NOISE_AUTOK_COUNT;
+			delay = PROXIMITY_NOISE_AUTOK_DELAY;
+		}else{
+			count = PROXIMITY_AUTOK_COUNT;
+			delay = PROXIMITY_AUTOK_DELAY;
 		}
+		log("count=%d, delay=%d, period=%d\n", count, delay, g_ps_data->cur_period);
+		/* ASUS BSP--- */
+		
+		/*update the min crosstalk value*/
+		for(round=0; round<count; round++){	
+			mdelay(delay);
+			adc_value = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_adc();
+			log("proximity auto calibration adc : %d\n", adc_value);
+			if(adc_value < crosstalk_min ){
+				crosstalk_min = adc_value;
+				log("Update the min for crosstalk : %d\n", crosstalk_min);
+			}
+		}
+		/*update the diff crosstalk value*/
+		crosstalk_diff = crosstalk_min -g_ps_data->g_ps_calvalue_inf;
 	}
 
-	/*update the diff crosstalk value*/
-	crosstalk_diff = crosstalk_min -g_ps_data->g_ps_calvalue_inf;
 	if(crosstalk_diff>g_ps_data->g_ps_autok_min && crosstalk_diff<g_ps_data->g_ps_autok_max){
 		log("Update the diff for crosstalk : %d\n", crosstalk_diff);
 		
@@ -2834,20 +2785,31 @@ static void proximity_autok(struct work_struct *work)
 	int adc_value;
 	int crosstalk_diff, crosstalk_limit;
 
+	mutex_lock(&g_alsps_lock);
+	if(g_ps_data->HAL_switch_on ==false){
+		log("proximity has closed, cancel proximity autok polling");
+		hrtimer_cancel(&g_alsps_timer);
+		mutex_unlock(&g_alsps_lock);
+		return;
+	}
+
 	/* proximity sensor go to suspend, cancel autok timer */
 	if(g_alsps_power_status == ALSPS_SUSPEND){
 		hrtimer_cancel(&g_alsps_timer);
 		log("proximity has suspended, cancel proximity autoK polling!!");
+		mutex_unlock(&g_alsps_lock);
 		return;
 	}
 
 	if(g_ALSPS_hw_client->mpsensor_hw->proximity_hw_set_autoK == NULL) {
 		err("proximity_hw_set_autoK NOT SUPPORT. \n");
+		mutex_unlock(&g_alsps_lock);
 		return;
 	}
 
 	adc_value = g_ALSPS_hw_client->mpsensor_hw->proximity_hw_get_adc();
 	if(adc_value < 0){
+		mutex_unlock(&g_alsps_lock);
 		return;
 	} else {
 		dbg("auto calibration polling : %d\n", adc_value);
@@ -2890,6 +2852,7 @@ static void proximity_autok(struct work_struct *work)
 			g_ps_data->crosstalk_diff = crosstalk_diff;
 		}
 	}
+	mutex_unlock(&g_alsps_lock);
 }
 
 static enum hrtimer_restart proximity_timer_function(struct hrtimer *timer)
@@ -3070,28 +3033,29 @@ static int init_data(void)
 	}
 	memset(g_ps_data, 0, sizeof(struct psensor_data));
 	g_ps_data->Device_switch_on = false;
-	g_ps_data->HAL_switch_on =    false;	
+	g_ps_data->HAL_switch_on =    false;
 	g_ps_data->polling_mode =     true;
 #ifdef CONFIG_TMD2755_FLAG
 	g_ps_data->autok =            false;
 #else
 	g_ps_data->autok =            true;
 #endif
+	/* ASUS BSP: add psensor recovery status for re-autok issue */
+	g_ps_data->recovery_mode = false;
 
 	
 	g_ps_data->g_ps_calvalue_hi = g_ALSPS_hw_client->mpsensor_hw->proximity_hi_threshold_default;
-	g_ps_data->g_ps_calvalue_lo = g_ALSPS_hw_client->mpsensor_hw->proximity_low_threshold_default;	
-	g_ps_data->g_ps_calvalue_inf = g_ALSPS_hw_client->mpsensor_hw->proximity_crosstalk_default;	
-#ifdef CONFIG_TMD2755_FLAG
+	g_ps_data->g_ps_calvalue_lo = g_ALSPS_hw_client->mpsensor_hw->proximity_low_threshold_default;
+	g_ps_data->g_ps_calvalue_inf = g_ALSPS_hw_client->mpsensor_hw->proximity_crosstalk_default;
 	g_ps_data->g_ps_calvalue_offset = g_ALSPS_hw_client->mpsensor_hw->proximity_offset_default;
 	g_ps_data->oil_flag = PROXIMITY_OIL_ALGO_DEFAULT_FLAG;
-#endif
 	g_ps_data->g_ps_factory_cal_hi = g_ALSPS_hw_client->mpsensor_hw->proximity_hi_threshold_default;
 	g_ps_data->g_ps_factory_cal_lo = g_ALSPS_hw_client->mpsensor_hw->proximity_low_threshold_default;
 	g_pocket_mode_threshold = PROXIMITY_POCKET_DEFAULT;
+	g_pocket_mode_threshold_orig = PROXIMITY_POCKET_DEFAULT;
 
-	g_ps_data->g_ps_autok_min= g_ALSPS_hw_client->mpsensor_hw->proximity_autok_min;	
-	g_ps_data->g_ps_autok_max = g_ALSPS_hw_client->mpsensor_hw->proximity_autok_max;	
+	g_ps_data->g_ps_autok_min= g_ALSPS_hw_client->mpsensor_hw->proximity_autok_min;
+	g_ps_data->g_ps_autok_max = g_ALSPS_hw_client->mpsensor_hw->proximity_autok_max;
 
 	g_ps_data->int_counter = 0;
 	g_ps_data->event_counter = 0;
@@ -3101,7 +3065,8 @@ static int init_data(void)
 #else
 	g_ps_data->selection = 1;
 #endif
-	g_ps_data->cur_period = PROXIMITY_PERIOD;
+	g_ps_data->cur_period = PROXIMITY_BASIC_PERIOD;
+
 	g_ps_data->pocket_mode = false;
 	/* Reset ASUS_light_sensor_data */
 	g_als_data = kmalloc(sizeof(struct lsensor_data), GFP_KERNEL);
@@ -3125,8 +3090,8 @@ static int init_data(void)
 	g_als_data->dynamic_sensitive = g_ALSPS_hw_client->mlsensor_hw->light_hw_get_current_sensitive();
 	g_als_data->dynamic_IT = g_ALSPS_hw_client->mlsensor_hw->light_hw_get_current_IT();
 	g_als_data->selection = 0;
-	g_als_data->ts.tv_sec = 0;
-	g_als_data->ts.tv_nsec = 0;
+	g_als_data->IT_change_ts.tv_sec = 0;
+	g_als_data->IT_change_ts.tv_nsec = 0;
 	g_als_data->evt_skip_time_ns = 0;
 	/* ASUS BSP Clay: shift lux to mitigate psensor noise when psensor on and lux < offset +++ */
 	g_als_data->offset_adc = LIGHT_LOW_LUX_NOISE_OFFSET;
@@ -3149,7 +3114,7 @@ init_data_err:
 	err("Init Data ERROR\n");
 	return ret;
 }
- 
+
 static void mALSPS_algo_probe(struct i2c_client *client)
 {
 	int ret;
@@ -3164,7 +3129,7 @@ static void mALSPS_algo_probe(struct i2c_client *client)
 	/*link driver data to i2c client*/
 	strlcpy(client->name, SENSOR_TYPE_NAME, I2C_NAME_SIZE);
 	i2c_set_clientdata(client, g_als_data);
-	i2c_set_clientdata(client, g_ps_data);	
+	i2c_set_clientdata(client, g_ps_data);
 
 	/* i2c client */
 	g_i2c_client = client;
@@ -3217,16 +3182,16 @@ static void mALSPS_algo_probe(struct i2c_client *client)
 	ret = lsensor_report_register();
 	if (ret < 0)
 		goto probe_err;
-	
+
 #ifdef CONFIG_TMD2755_FLAG
 	ALSPS_SENSOR_IRQ = tmd2755_gpio_register(g_i2c_client);
-	if (ALSPS_SENSOR_IRQ < 0)
-		goto probe_err;
+	mALSPSsensor_GPIO.ALSPSsensor_isr = NULL;
 #else
 	ALSPS_SENSOR_IRQ = ALSPSsensor_gpio_register(g_i2c_client, &mALSPSsensor_GPIO);
+#endif
 	if (ALSPS_SENSOR_IRQ < 0)
 		goto probe_err;
-#endif
+
 	/*To avoid LUX can NOT report when reboot in LUX=0*/
 	log("[INIT] Light sensor report -1)\n");
 	lsensor_report_lux(-1);
@@ -3361,10 +3326,17 @@ static ALSPS_I2C mALSPS_I2C = {
 };
 
 extern int ALSPS_i2c_add_driver(void);
+#if defined ASUS_VODKA_PROJECT
+extern void ALSPS_init_2nd(struct work_struct *work);
+DECLARE_WORK(ALSPS_init_2nd_work, ALSPS_init_2nd);
+void ALSPS_exit_2nd(struct work_struct *work);
+DECLARE_WORK(ALSPS_exit_2nd_work, ALSPS_exit_2nd);
+#endif
 static int __init ALSPS_init(void)
 {
 	int ret = 0;
 	log("Driver INIT +++\n");
+	g_tmd2755_status_param.probe_status = true;
 
 	/*Record the error message*/
 	g_error_mesg = kzalloc(sizeof(char [ERROR_MESG_SIZE]), GFP_KERNEL);
@@ -3380,9 +3352,16 @@ static int __init ALSPS_init(void)
 	/* Initialize the wake lock */
 	//wake_lock_init(&g_alsps_wake_lock, &g_i2c_client->dev, "ALSPS_wake_lock");
 	g_alsps_wake_lock = wakeup_source_register(NULL, "ALSPS_wake_lock");
-#ifdef CONFIG_TMD2755_FLAG
+
+	if (alarmtimer_get_rtcdev()) {
+		alarm_init(&g_oil_alarm_timer, ALARM_BOOTTIME, oil_algo_timer);
+	} else {
+		pr_err("Failed to get soc alarm-timer\n");
+		return -EINVAL;
+	}
+
+	INIT_WORK(&g_oil_polling_work, oil_polling_work_func);
 	g_alsps_oil_wake = wakeup_source_register(NULL, "ALSPS_oil_wake_lock");
-#endif
 
 	/*Initialize high resolution timer*/
 	hrtimer_init(&g_alsps_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -3399,6 +3378,9 @@ static int __init ALSPS_init(void)
 		goto init_err;
 	
 	log("Driver INIT ---\n");
+#if defined ASUS_VODKA_PROJECT
+	schedule_work(&ALSPS_init_2nd_work);
+#endif
 	return 0;
 
 init_err:
@@ -3435,6 +3417,9 @@ static void __exit ALSPS_exit(void)
 	destroy_workqueue(ALSPS_workqueue);
 	destroy_workqueue(ALSPS_delay_workqueue);
 	
+#if defined ASUS_VODKA_PROJECT
+	schedule_work(&ALSPS_exit_2nd_work);
+#endif
 	log("Driver EXIT ---\n");
 }
 
@@ -3444,4 +3429,6 @@ module_exit(ALSPS_exit);
 MODULE_AUTHOR("Clay_Wang <Clay_Wang@asus.com>");
 MODULE_DESCRIPTION("Proximity and Ambient Light Sensor");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);
+MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 

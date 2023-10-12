@@ -590,6 +590,19 @@ int mesh_add_he_oper_ie(struct ieee80211_sub_if_data *sdata,
 int mesh_add_he_6ghz_cap_ie(struct ieee80211_sub_if_data *sdata,
 			    struct sk_buff *skb)
 {
+	struct ieee80211_supported_band *sband;
+	const struct ieee80211_sband_iftype_data *iftd;
+
+	sband = ieee80211_get_sband(sdata);
+	if (!sband)
+		return -EINVAL;
+
+	iftd = ieee80211_get_sband_iftype_data(sband,
+					       NL80211_IFTYPE_MESH_POINT);
+	/* The device doesn't support HE in mesh mode or at all */
+	if (!iftd)
+		return 0;
+
 	ieee80211_ie_build_he_6ghz_cap(sdata, skb);
 	return 0;
 }
@@ -1273,8 +1286,8 @@ static void ieee80211_mesh_rx_bcn_presp(struct ieee80211_sub_if_data *sdata,
 	}
 
 	if (ifmsh->sync_ops)
-		ifmsh->sync_ops->rx_bcn_presp(sdata,
-			stype, mgmt, &elems, rx_status);
+		ifmsh->sync_ops->rx_bcn_presp(sdata, stype, mgmt, len,
+					      elems.mesh_config, rx_status);
 }
 
 int ieee80211_mesh_finish_csa(struct ieee80211_sub_if_data *sdata)

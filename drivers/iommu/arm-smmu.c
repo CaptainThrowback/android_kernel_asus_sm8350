@@ -172,7 +172,7 @@ static int arm_smmu_domain_get_attr(struct iommu_domain *domain,
 static inline int arm_smmu_rpm_get(struct arm_smmu_device *smmu)
 {
 	if (pm_runtime_enabled(smmu->dev))
-		return pm_runtime_get_sync(smmu->dev);
+		return pm_runtime_resume_and_get(smmu->dev);
 
 	return 0;
 }
@@ -365,7 +365,8 @@ static void arm_smmu_arch_write_sync(struct arm_smmu_device *smmu)
 		return;
 
 	/* Read to complete prior write transcations */
-	id = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_ID0);
+	id = arm_smmu_readl(smmu, ARM_SMMU_IMPL_DEF0, 0);
+
 
 	/* Wait for read to complete before off */
 	rmb();
@@ -656,8 +657,6 @@ static void arm_smmu_power_off_atomic(struct arm_smmu_device *smmu,
 {
 	unsigned long flags;
 
-	arm_smmu_arch_write_sync(smmu);
-
 	spin_lock_irqsave(&pwr->clock_refs_lock, flags);
 	if (pwr->clock_refs_count == 0) {
 		WARN(1, "%s: bad clock_ref_count\n", dev_name(pwr->dev));
@@ -670,6 +669,7 @@ static void arm_smmu_power_off_atomic(struct arm_smmu_device *smmu,
 		return;
 	}
 
+	arm_smmu_arch_write_sync(smmu);
 	arm_smmu_disable_clocks(pwr);
 
 	pwr->clock_refs_count = 0;
@@ -970,6 +970,11 @@ static void arm_smmu_tlb_inv_walk(unsigned long iova, size_t size,
 	struct arm_smmu_domain *smmu_domain = cookie;
 	const struct arm_smmu_flush_ops *ops = smmu_domain->flush_ops;
 
+	if (!IS_ENABLED(CONFIG_QCOM_IOMMU_TLBI_QUIRKS)) {
+		smmu_domain->defer_flush = true;
+		return;
+	}
+
 	ops->tlb_inv_range(iova, size, granule, false, cookie);
 	ops->tlb_sync(cookie);
 }
@@ -979,6 +984,11 @@ static void arm_smmu_tlb_inv_leaf(unsigned long iova, size_t size,
 {
 	struct arm_smmu_domain *smmu_domain = cookie;
 	const struct arm_smmu_flush_ops *ops = smmu_domain->flush_ops;
+
+	if (!IS_ENABLED(CONFIG_QCOM_IOMMU_TLBI_QUIRKS)) {
+		smmu_domain->defer_flush = true;
+		return;
+	}
 
 	ops->tlb_inv_range(iova, size, granule, true, cookie);
 	ops->tlb_sync(cookie);
@@ -990,6 +1000,11 @@ static void arm_smmu_tlb_add_page(struct iommu_iotlb_gather *gather,
 {
 	struct arm_smmu_domain *smmu_domain = cookie;
 	const struct arm_smmu_flush_ops *ops = smmu_domain->flush_ops;
+
+	if (!IS_ENABLED(CONFIG_QCOM_IOMMU_TLBI_QUIRKS)) {
+		smmu_domain->defer_flush = true;
+		return;
+	}
 
 	ops->tlb_inv_range(iova, granule, granule, true, cookie);
 }
@@ -1160,6 +1175,19 @@ static const struct arm_smmu_flush_ops arm_smmu_s2_tlb_ops_v1 = {
 	.tlb_inv_range		= arm_smmu_tlb_inv_vmid_nosync,
 	.tlb_sync		= arm_smmu_tlb_sync_vmid,
 };
+
+static void arm_smmu_deferred_flush(struct arm_smmu_domain *smmu_domain)
+{
+	/*
+	 * This checks for deferred invalidations, and perform flush all.
+	 * Deferred invalidations helps replace multiple invalidations with
+	 * single flush
+	 */
+	if (smmu_domain->defer_flush) {
+		smmu_domain->flush_ops->tlb.tlb_flush_all(smmu_domain);
+		smmu_domain->defer_flush = false;
+	}
+}
 
 static void print_ctx_regs(struct arm_smmu_device *smmu, struct arm_smmu_cfg
 			   *cfg, unsigned int fsr)
@@ -1333,6 +1361,7 @@ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 	bool fatal_asf = smmu->options & ARM_SMMU_OPT_FATAL_ASF;
 	phys_addr_t phys_soft;
 	uint64_t pte;
+	unsigned int ias = smmu_domain->pgtbl_info[0].pgtbl_cfg.ias;
 	bool non_fatal_fault = test_bit(DOMAIN_ATTR_NON_FATAL_FAULTS,
 					smmu_domain->attributes);
 
@@ -1371,6 +1400,16 @@ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 		flags |= IOMMU_FAULT_TRANSACTION_STALLED;
 
 	iova = arm_smmu_cb_readq(smmu, idx, ARM_SMMU_CB_FAR);
+
+	/*
+	 * The address in the CB's FAR is not sign-extended, so lets perform the
+	 * sign extension here, as arm_smmu_iova_to_phys() expects the
+	 * IOVA to be sign extended.
+	 */
+	if ((iova & BIT_ULL(ias)) &&
+	    (test_bit(DOMAIN_ATTR_SPLIT_TABLES, smmu_domain->attributes)))
+		iova |= GENMASK_ULL(63, ias + 1);
+
 	phys_soft = arm_smmu_iova_to_phys(domain, iova);
 	frsynra = arm_smmu_gr1_read(smmu, ARM_SMMU_GR1_CBFRSYNRA(cfg->cbndx));
 	tmp = report_iommu_fault(domain, smmu->dev, iova, flags);
@@ -1687,6 +1726,7 @@ static void arm_smmu_write_context_bank(struct arm_smmu_device *smmu, int idx,
 
 		reg |= FIELD_PREP(SCTLR_WACFG, SCTLR_WACFG_WA) |
 		       FIELD_PREP(SCTLR_RACFG, SCTLR_RACFG_RA) |
+		       FIELD_PREP(SCTLR_SHCFG, SCTLR_SHCFG_OSH) |
 		       SCTLR_MTCFG |
 		       FIELD_PREP(SCTLR_MEM_ATTR, SCTLR_MEM_ATTR_OISH_WB_CACHE);
 	} else {
@@ -2994,7 +3034,6 @@ static int __bus_lookup_iommu_group(struct device *dev, void *priv)
 	}
 
 	data->group = group;
-	iommu_group_put(group);
 	return 1;
 }
 
@@ -3183,6 +3222,9 @@ static int arm_smmu_map(struct iommu_domain *domain, unsigned long iova,
 	arm_smmu_rpm_get(smmu);
 	spin_lock_irqsave(&smmu_domain->cb_lock, flags);
 	ret = ops->map(ops, iova, paddr, size, prot);
+
+	arm_smmu_deferred_flush(smmu_domain);
+
 	spin_unlock_irqrestore(&smmu_domain->cb_lock, flags);
 	arm_smmu_rpm_put(smmu);
 
@@ -3197,6 +3239,7 @@ static int arm_smmu_map(struct iommu_domain *domain, unsigned long iova,
 		list_splice_init(&nonsecure_pool, &smmu_domain->nonsecure_pool);
 		ret = ops->map(ops, iova, paddr, size, prot);
 		list_splice_init(&smmu_domain->nonsecure_pool, &nonsecure_pool);
+		arm_smmu_deferred_flush(smmu_domain);
 		spin_unlock_irqrestore(&smmu_domain->cb_lock, flags);
 		arm_smmu_rpm_put(smmu);
 		arm_smmu_release_prealloc_memory(smmu_domain, &nonsecure_pool);
@@ -3358,6 +3401,7 @@ static size_t arm_smmu_map_sg(struct iommu_domain *domain, unsigned long iova,
 		spin_lock_irqsave(&smmu_domain->cb_lock, flags);
 		ret = pgtbl_info->map_sg(ops, iova, sg_start,
 					 idx_end - idx_start, prot, &size);
+		arm_smmu_deferred_flush(smmu_domain);
 		spin_unlock_irqrestore(&smmu_domain->cb_lock, flags);
 
 		if (ret == -ENOMEM) {
@@ -3377,6 +3421,7 @@ static size_t arm_smmu_map_sg(struct iommu_domain *domain, unsigned long iova,
 						 &size);
 			list_splice_init(&smmu_domain->nonsecure_pool,
 					 &nonsecure_pool);
+			arm_smmu_deferred_flush(smmu_domain);
 			spin_unlock_irqrestore(&smmu_domain->cb_lock, flags);
 			arm_smmu_release_prealloc_memory(smmu_domain,
 							 &nonsecure_pool);
@@ -3668,6 +3713,9 @@ static struct iommu_group *arm_smmu_device_group(struct device *dev)
 	int i, idx;
 
 	group = of_get_device_group(dev);
+	if (group)
+		goto finish;
+
 	for_each_cfg_sme(fwspec, i, idx) {
 		if (group && smmu->s2crs[idx].group &&
 		    group != smmu->s2crs[idx].group) {
@@ -3694,6 +3742,7 @@ static struct iommu_group *arm_smmu_device_group(struct device *dev)
 			return NULL;
 	}
 
+finish:
 	if (smmu->impl && smmu->impl->device_group &&
 	    smmu->impl->device_group(dev, group)) {
 		iommu_group_put(group);
@@ -4387,7 +4436,7 @@ static int arm_smmu_handoff_cbs(struct arm_smmu_device *smmu)
 		if (!(raw_smr & SMR_VALID))
 			continue;
 
-		smr.mask = FIELD_GET(SMR_MASK, raw_smr);
+		smr.mask = FIELD_GET(SMR_MASK, raw_smr & ~SMR_VALID);
 		smr.id = FIELD_GET(SMR_ID, raw_smr);
 		smr.valid = true;
 
@@ -5066,9 +5115,9 @@ static int arm_smmu_device_dt_probe(struct platform_device *pdev)
 	 * management code in GKI results in slow unmap calls. To alleviate
 	 * that, we can remove the latency incurred by enabling/disabling the
 	 * power resources, by always keeping them on.
+	 *
 	 */
-	if (IS_ENABLED(CONFIG_ARM_SMMU_POWER_ALWAYS_ON) &&
-	    of_property_read_bool(dev->of_node, "qcom,power-always-on"))
+	if (IS_ENABLED(CONFIG_ARM_SMMU_POWER_ALWAYS_ON))
 		arm_smmu_power_on(smmu->pwr);
 
 	/*
@@ -5127,8 +5176,7 @@ static int arm_smmu_device_remove(struct platform_device *pdev)
 	arm_smmu_power_off(smmu, smmu->pwr);
 
 	/* Remove the extra reference that was taken in the probe function */
-	if (IS_ENABLED(CONFIG_ARM_SMMU_POWER_ALWAYS_ON) &&
-	    of_property_read_bool(pdev->dev.of_node, "qcom,power-always-on"))
+	if (IS_ENABLED(CONFIG_ARM_SMMU_POWER_ALWAYS_ON))
 		arm_smmu_power_off(smmu, smmu->pwr);
 
 	arm_smmu_exit_power_resources(smmu->pwr);

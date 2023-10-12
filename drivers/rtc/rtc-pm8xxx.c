@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2010-2011, 2019-2020, The Linux Foundation. All rights reserved. */
+/* Copyright (c) 2010-2011, 2019-2021, The Linux Foundation. All rights reserved. */
 
 #include <linux/of.h>
 #include <linux/module.h>
@@ -170,6 +170,53 @@ rtc_rw_fail:
 
 	return rc;
 }
+
+//[+++]ASUS_BSP for battery safety Upgrade and battery health
+struct pm8xxx_rtc *asus_rtc_dd;
+unsigned long asus_qpnp_rtc_read_time(void)
+{
+	int rc=-1;
+	u8 value[NUM_8_BIT_RTC_REGS];
+	unsigned long secs;
+	unsigned int reg;
+	const struct pm8xxx_rtc_regs *regs = asus_rtc_dd->regs;
+
+	if(!asus_rtc_dd){
+		pr_err("asus rtc add is NULL!\n");
+		return rc;
+	}
+
+	rc = regmap_bulk_read(asus_rtc_dd->regmap, regs->read, value, sizeof(value));
+	if (rc) {
+		pr_err("RTC read data register failed\n");
+		return rc;
+	}
+
+	/*
+	 * Read the LSB again and check if there has been a carry over.
+	 * If there is, redo the read operation.
+	 */
+	rc = regmap_read(asus_rtc_dd->regmap, regs->read, &reg);
+	if (rc < 0) {
+		pr_err("RTC read data register failed\n");
+		return rc;
+	}
+
+	if (unlikely(reg < value[0])) {
+		rc = regmap_bulk_read(asus_rtc_dd->regmap, regs->read,
+				      value, sizeof(value));
+		if (rc) {
+			pr_err("RTC read data register failed\n");
+			return rc;
+		}
+	}
+
+	secs = value[0] | (value[1] << 8) | (value[2] << 16) | (value[3] << 24);
+
+	return secs;
+}
+EXPORT_SYMBOL(asus_qpnp_rtc_read_time);
+//[+++]ASUS_BSP for battery safety Upgrade and battery health
 
 static int pm8xxx_rtc_read_time(struct device *dev, struct rtc_time *tm)
 {
@@ -462,6 +509,16 @@ static const struct pm8xxx_rtc_regs pmk8350_regs = {
 	.alarm_en	= BIT(7),
 };
 
+static const struct pm8xxx_rtc_regs pm5100_regs = {
+	.ctrl		= 0x6446,
+	.write		= 0x6440,
+	.read		= 0x6448,
+	.alarm_rw	= 0x6540,
+	.alarm_ctrl	= 0x6546,
+	.alarm_ctrl2	= 0x6548,
+	.alarm_en	= BIT(7),
+};
+
 /*
  * Hardcoded RTC bases until IORESOURCE_REG mapping is figured out
  */
@@ -471,10 +528,13 @@ static const struct of_device_id pm8xxx_id_table[] = {
 	{ .compatible = "qcom,pm8058-rtc", .data = &pm8058_regs },
 	{ .compatible = "qcom,pm8941-rtc", .data = &pm8941_regs },
 	{ .compatible = "qcom,pmk8350-rtc", .data = &pmk8350_regs },
+	{ .compatible = "qcom,pm5100-rtc", .data = &pm5100_regs },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, pm8xxx_id_table);
 
+bool rtc_probe_done = false; //ASUS_BSP for battery safety Upgrade and battery health
+EXPORT_SYMBOL(rtc_probe_done);
 static int pm8xxx_rtc_probe(struct platform_device *pdev)
 {
 	int rc;
@@ -534,6 +594,14 @@ static int pm8xxx_rtc_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Request IRQ failed (%d)\n", rc);
 		return rc;
 	}
+
+	if (of_property_read_bool(pdev->dev.of_node, "disable-alarm-wakeup"))
+		device_set_wakeup_capable(&pdev->dev, false);
+
+//[+++]ASUS_BSP for battery safety Upgrade and battery health
+	asus_rtc_dd = rtc_dd;
+	rtc_probe_done = true;
+//[---]ASUS_BSP for battery safety Upgrade and battery health
 
 	dev_dbg(&pdev->dev, "Probe success !!\n");
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) 2007 Google, Inc.
- * Copyright (c) 2012-2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2021 The Linux Foundation. All rights reserved.
  */
 
 #include "msm_qpic_nand.h"
@@ -17,6 +17,39 @@
 #define MAX_DESC 16
 #define SMEM_AARM_PARTITION_TABLE 9
 #define SMEM_APPS 0
+#define ONE_CODEWORD_SIZE 516
+
+static struct device *dev_node;
+static int msm_nand_bam_panic_notifier(struct notifier_block *this,
+					unsigned long event, void *ptr)
+{
+	struct msm_nand_info *info = dev_get_drvdata(dev_node);
+
+	pr_info("Dumping APSS bam pipes register dumps\n");
+	sps_get_bam_debug_info(info->sps.bam_handle, 93,
+			(SPS_BAM_PIPE(0) |
+			 SPS_BAM_PIPE(1) |
+			 SPS_BAM_PIPE(2) |
+			 SPS_BAM_PIPE(3)),
+			 0, 2);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block msm_nand_bam_panic_blk = {
+	.notifier_call = msm_nand_bam_panic_notifier,
+};
+
+void msm_nand_bam_register_panic_handler(void)
+{
+	atomic_notifier_chain_register(&panic_notifier_list,
+			&msm_nand_bam_panic_blk);
+}
+
+void msm_nand_bam_unregister_panic_handler(void)
+{
+	atomic_notifier_chain_unregister(&panic_notifier_list,
+					&msm_nand_bam_panic_blk);
+}
 
 /*
  * Get the DMA memory for requested amount of size. It returns the pointer
@@ -102,10 +135,64 @@ static dma_addr_t msm_nand_dma_map(struct device *dev, void *addr, size_t size,
 	return dma_map_page(dev, page, offset, size, dir);
 }
 
+static int msm_nand_bus_set_vote(struct msm_nand_info *info, bool vote)
+{
+	struct msm_nand_bus_vote_data *bvd = info->clk_data.bus_vote_data;
+	struct msm_bus_path *usecase = bvd->usecase;
+	struct msm_bus_vectors *vec = usecase[vote].vec;
+	int ddr_rc;
+
+	if (vote == bvd->curr_vote)
+		return 0;
+
+	pr_debug("vote:%d nand_ddr ab:%llu ib:%llu\n",
+			vote, vec[0].ab, vec[0].ib);
+	ddr_rc = icc_set_bw(bvd->nand_ddr, vec[0].ab, vec[0].ib);
+	if (ddr_rc) {
+		pr_err("icc_set() failed\n");
+		goto out;
+	}
+	bvd->curr_vote = vote;
+out:
+	return ddr_rc;
+}
+
 static int msm_nand_setup_clocks_and_bus_bw(struct msm_nand_info *info,
 				bool vote)
 {
-	return 0;
+	int ret = 0;
+
+	if (!info->clk_data.rpmh_clk) {
+		if (IS_ERR_OR_NULL(info->clk_data.qpic_clk)) {
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+	if (atomic_read(&info->clk_data.clk_enabled) == vote)
+		goto out;
+	if (!atomic_read(&info->clk_data.clk_enabled) && vote) {
+		ret = msm_nand_bus_set_vote(info, 1);
+		if (ret) {
+			pr_err("Failed to vote for bus with %d\n", ret);
+			goto out;
+		}
+		if (!info->clk_data.rpmh_clk) {
+			ret = clk_prepare_enable(info->clk_data.qpic_clk);
+			if (ret) {
+				pr_err("Failed to enable the bus-clock with error %d\n",
+					ret);
+				msm_nand_bus_set_vote(info, 0);
+				goto out;
+			}
+		}
+	} else if (atomic_read(&info->clk_data.clk_enabled) && !vote) {
+		if (!info->clk_data.rpmh_clk)
+			clk_disable_unprepare(info->clk_data.qpic_clk);
+		msm_nand_bus_set_vote(info, 0);
+	}
+	atomic_set(&info->clk_data.clk_enabled, vote);
+out:
+	return ret;
 }
 
 #ifdef CONFIG_PM
@@ -226,14 +313,114 @@ static int msm_nand_put_device(struct device *dev)
 }
 #endif
 
+static struct msm_nand_bus_vote_data *msm_nand_get_bus_vote_data(struct device
+				       *dev)
+
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct device_node *of_node = dev->of_node;
+	struct msm_nand_bus_vote_data *bvd = NULL;
+	struct msm_bus_path *usecase = NULL;
+	int ret = 0, i = 0, j, num_paths, len;
+	const u32 *vec_arr = NULL;
+
+	if (!pdev) {
+		dev_err(dev, "Null platform device!\n");
+		return NULL;
+	}
+
+	bvd = devm_kzalloc(dev, sizeof(*bvd), GFP_KERNEL);
+	if (!bvd)
+		return bvd;
+
+	ret = of_property_read_string(of_node, "qcom,msm-bus,name",
+					&bvd->name);
+	if (ret) {
+		dev_err(dev, "Bus name missing err:(%d)\n", ret);
+		goto out;
+	}
+
+	ret = of_property_read_u32(of_node, "qcom,msm-bus,num-cases",
+		&bvd->num_usecase);
+	if (ret) {
+		dev_err(dev, "num-usecases not found err:(%d)\n", ret);
+		goto out;
+	}
+
+	usecase = devm_kzalloc(dev, (sizeof(struct msm_bus_path) *
+				   bvd->num_usecase), GFP_KERNEL);
+	if (!usecase)
+		goto out;
+
+	ret = of_property_read_u32(of_node, "qcom,msm-bus,num-paths",
+				   &num_paths);
+	if (ret) {
+		dev_err(dev, "num_paths not found err:(%d)\n", ret);
+		goto out;
+	}
+
+	vec_arr = of_get_property(of_node, "qcom,msm-bus,vectors-KBps", &len);
+	if (!vec_arr) {
+		dev_err(dev, "Vector array not found\n");
+		goto out;
+	}
+
+	for (i = 0; i < bvd->num_usecase; i++) {
+		usecase[i].num_paths = num_paths;
+		usecase[i].vec = devm_kcalloc(dev, num_paths,
+					      sizeof(struct msm_bus_vectors),
+					      GFP_KERNEL);
+		if (!usecase[i].vec)
+			goto out;
+		for (j = 0; j < num_paths; j++) {
+			int idx = ((i * num_paths) + j) * 2;
+
+			usecase[i].vec[j].ab = (u64)
+				be32_to_cpu(vec_arr[idx]);
+			usecase[i].vec[j].ib = (u64)
+				be32_to_cpu(vec_arr[idx + 1]);
+		}
+	}
+
+	bvd->usecase = usecase;
+	return bvd;
+out:
+	bvd = NULL;
+	return bvd;
+}
+
 static int msm_nand_bus_register(struct platform_device *pdev,
 		struct msm_nand_info *info)
 {
-	return 0;
+	struct msm_nand_bus_vote_data *bsd;
+	struct device *dev = &pdev->dev;
+	int ret = 0;
+
+	bsd = msm_nand_get_bus_vote_data(dev);
+	if (!bsd) {
+		dev_err(&pdev->dev, "Failed to get bus_scale data\n");
+		return -EINVAL;
+	}
+	info->clk_data.bus_vote_data = bsd;
+
+	bsd->nand_ddr = of_icc_get(&pdev->dev, "nand-ddr");
+	if (IS_ERR_OR_NULL(bsd->nand_ddr)) {
+		dev_err(&pdev->dev, "(%ld): failed getting %s path\n",
+			PTR_ERR(bsd->nand_ddr), "nand-ddr");
+		ret = PTR_ERR(bsd->nand_ddr);
+		bsd->nand_ddr = NULL;
+		return ret;
+	}
+
+	return ret;
 }
 
 static void msm_nand_bus_unregister(struct msm_nand_info *info)
 {
+	struct msm_nand_bus_vote_data *bsd = info->clk_data.bus_vote_data;
+
+	if (bsd)
+		icc_put(bsd->nand_ddr);
 }
 
 /*
@@ -580,6 +767,7 @@ static int msm_nand_flash_onfi_probe(struct msm_nand_info *info)
 	struct flash_identification *flash = &info->flash_dev;
 	uint32_t crc_chk_count = 0, page_address = 0;
 	int ret = 0, i = 0, submitted_num_desc = 1;
+	uint32_t manid, devid;
 
 	/* SPS parameters */
 	struct msm_nand_sps_cmd *cmd, *curr_cmd;
@@ -791,6 +979,14 @@ static int msm_nand_flash_onfi_probe(struct msm_nand_info *info)
 
 	pr_info("Found an ONFI compliant device %s\n",
 			onfi_param_page_ptr->device_model);
+
+	manid  = flash->flash_id & 0xFF;
+	devid  = (flash->flash_id >> 8) & 0xFF;
+
+	/* hack for 8 x 8 JSC MCP part */
+	if (manid == 0xAD && devid == 0xA3)
+		flash->density = flash->density * 2;
+
 	/*
 	 * Temporary hack for MT29F4G08ABC device.
 	 * Since the device is not properly adhering
@@ -913,10 +1109,16 @@ static int msm_nand_validate_mtd_params(struct mtd_info *mtd, bool read,
 			err = -EINVAL;
 			goto out;
 		}
-		args->page_count = ops->len / (mtd->writesize + mtd->oobsize);
+		if (ops->len <= ONE_CODEWORD_SIZE)
+			args->page_count = 1;
+		else
+			args->page_count = ops->len /
+				(mtd->writesize + mtd->oobsize);
 
 	} else if (ops->mode == MTD_OPS_AUTO_OOB) {
-		if (ops->datbuf && (ops->len % mtd->writesize) != 0) {
+		if (ops->datbuf && (ops->len %
+			((ops->len <= ONE_CODEWORD_SIZE) ?
+			ONE_CODEWORD_SIZE : mtd->writesize)) != 0) {
 			/* when ops->datbuf is NULL, ops->len can be ooblen */
 			pr_err("unsupported data len %d for AUTO mode\n",
 					ops->len);
@@ -929,7 +1131,10 @@ static int msm_nand_validate_mtd_params(struct mtd_info *mtd, bool read,
 			if ((args->page_count == 0) && (ops->ooblen))
 				args->page_count = 1;
 		} else if (ops->datbuf) {
-			args->page_count = ops->len / mtd->writesize;
+			if (ops->len <= ONE_CODEWORD_SIZE)
+				args->page_count = 1;
+			else
+				args->page_count = ops->len / mtd->writesize;
 		}
 	}
 
@@ -975,12 +1180,20 @@ static void msm_nand_update_rw_reg_data(struct msm_nand_chip *chip,
 					struct msm_nand_rw_params *args,
 					struct msm_nand_rw_reg_data *data)
 {
+	/*
+	 * While reading one codeword, CW_PER_PAGE bits of  QPIC_NAND_DEV0_CFG0
+	 * should be set to 0, which implies 1 codeword per page. 'n' below,
+	 * is used to configure cfg0 for reading one full page or one single
+	 * codeword.
+	 */
+	int n = (ops->len <= ONE_CODEWORD_SIZE) ? args->cwperpage : 1;
+
 	if (args->read) {
 		if (ops->mode != MTD_OPS_RAW) {
 			data->cmd = MSM_NAND_CMD_PAGE_READ_ECC;
 			data->cfg0 =
 			(chip->cfg0 & ~(7U << CW_PER_PAGE)) |
-			(((args->cwperpage-1) - args->start_sector)
+			(((args->cwperpage-n) - args->start_sector)
 			 << CW_PER_PAGE);
 			data->cfg1 = chip->cfg1;
 			data->ecc_bch_cfg = chip->ecc_bch_cfg;
@@ -988,7 +1201,7 @@ static void msm_nand_update_rw_reg_data(struct msm_nand_chip *chip,
 			data->cmd = MSM_NAND_CMD_PAGE_READ_ALL;
 			data->cfg0 =
 			(chip->cfg0_raw & ~(7U << CW_PER_PAGE)) |
-			(((args->cwperpage-1) - args->start_sector)
+			(((args->cwperpage-n) - args->start_sector)
 			 << CW_PER_PAGE);
 			data->cfg1 = chip->cfg1_raw;
 			data->ecc_bch_cfg = chip->ecc_cfg_raw;
@@ -1032,6 +1245,11 @@ static void msm_nand_prep_rw_cmd_desc(struct mtd_oob_ops *ops,
 	uint32_t offset, size, last_read;
 	struct sps_command_element *curr_ce, *start_ce;
 	uint32_t *flags_ptr, *num_ce_ptr;
+	/*
+	 * Variable to configure read_location register parameters
+	 * while reading one codeword or one full page
+	 */
+	int n = (ops->len <= ONE_CODEWORD_SIZE) ? args->cwperpage : 1;
 
 	if (curr_cw == args->start_sector) {
 		curr_ce = start_ce = &cmd_list->setup_desc.ce[0];
@@ -1124,10 +1342,15 @@ static void msm_nand_prep_rw_cmd_desc(struct mtd_oob_ops *ops,
 	if (ops->mode == MTD_OPS_AUTO_OOB) {
 		if (ops->datbuf) {
 			offset = 0;
-			size = (curr_cw < (args->cwperpage - 1)) ? 516 :
-				(512 - ((args->cwperpage - 1) << 2));
-			last_read = (curr_cw < (args->cwperpage - 1)) ? 1 :
-				(ops->oobbuf ? 0 : 1);
+			if (ops->len <= ONE_CODEWORD_SIZE) {
+				size = ONE_CODEWORD_SIZE;
+				last_read = 1;
+			} else {
+				size = (curr_cw < (args->cwperpage - 1)) ? 516 :
+					(512 - ((args->cwperpage - 1) << 2));
+				last_read = (curr_cw < (args->cwperpage - 1)) ?
+					1 : (ops->oobbuf ? 0 : 1);
+			}
 			rdata = (offset << 0) | (size << 16) |
 				(last_read << 31);
 
@@ -1143,7 +1366,7 @@ static void msm_nand_prep_rw_cmd_desc(struct mtd_oob_ops *ops,
 				curr_ce++;
 			}
 		}
-		if (curr_cw == (args->cwperpage - 1) && ops->oobbuf) {
+		if (curr_cw == (args->cwperpage - n) && ops->oobbuf) {
 			offset = 512 - ((args->cwperpage - 1) << 2);
 			size = (args->cwperpage) << 2;
 			if (size > args->oob_len_cmd)
@@ -1201,6 +1424,11 @@ static int msm_nand_submit_rw_data_desc(struct mtd_oob_ops *ops,
 	uint32_t sectordatasize, sectoroobsize;
 	uint32_t sps_flags = 0;
 	int err = 0;
+	/*
+	 * Variable to configure sectordatasize and sectoroobsize
+	 * while reading one codeword or one full page.
+	 */
+	int n = (ops->len <= ONE_CODEWORD_SIZE) ? args->cwperpage : 1;
 
 	if (args->read)
 		data_pipe_handle = info->sps.data_prod.handle;
@@ -1209,7 +1437,7 @@ static int msm_nand_submit_rw_data_desc(struct mtd_oob_ops *ops,
 
 	if (ops->mode == MTD_OPS_RAW) {
 		if (ecc_parity_bytes && args->read) {
-			if (curr_cw == (args->cwperpage - 1))
+			if (curr_cw == (args->cwperpage - n))
 				sps_flags |= SPS_IOVEC_FLAG_INT;
 
 			/* read only ecc bytes */
@@ -1224,7 +1452,7 @@ static int msm_nand_submit_rw_data_desc(struct mtd_oob_ops *ops,
 			sectordatasize = chip->cw_size;
 			if (!args->read)
 				sps_flags = SPS_IOVEC_FLAG_EOT;
-			if (curr_cw == (args->cwperpage - 1))
+			if (curr_cw == (args->cwperpage - n))
 				sps_flags |= SPS_IOVEC_FLAG_INT;
 
 			err = sps_transfer_one(data_pipe_handle,
@@ -1237,8 +1465,13 @@ static int msm_nand_submit_rw_data_desc(struct mtd_oob_ops *ops,
 		}
 	} else if (ops->mode == MTD_OPS_AUTO_OOB) {
 		if (ops->datbuf) {
-			sectordatasize = (curr_cw < (args->cwperpage - 1))
-			? 516 : (512 - ((args->cwperpage - 1) << 2));
+			if (ops->len <= ONE_CODEWORD_SIZE)
+				sectordatasize = ONE_CODEWORD_SIZE;
+			else
+				sectordatasize =
+					(curr_cw < (args->cwperpage - 1))
+					? 516 :
+					(512 - ((args->cwperpage - 1) << 2));
 
 			if (!args->read) {
 				sps_flags = SPS_IOVEC_FLAG_EOT;
@@ -1246,7 +1479,7 @@ static int msm_nand_submit_rw_data_desc(struct mtd_oob_ops *ops,
 						ops->oobbuf)
 					sps_flags = 0;
 			}
-			if ((curr_cw == (args->cwperpage - 1)) && !ops->oobbuf)
+			if ((curr_cw == (args->cwperpage - n)) && !ops->oobbuf)
 				sps_flags |= SPS_IOVEC_FLAG_INT;
 
 			err = sps_transfer_one(data_pipe_handle,
@@ -1258,7 +1491,7 @@ static int msm_nand_submit_rw_data_desc(struct mtd_oob_ops *ops,
 			args->data_dma_addr_curr += sectordatasize;
 		}
 
-		if (ops->oobbuf && (curr_cw == (args->cwperpage - 1))) {
+		if (ops->oobbuf && (curr_cw == (args->cwperpage - n))) {
 			sectoroobsize = args->cwperpage << 2;
 			if (sectoroobsize > args->oob_len_data)
 				sectoroobsize = args->oob_len_data;
@@ -1508,9 +1741,10 @@ static int msm_nand_is_erased_page_ps(struct mtd_info *mtd, loff_t from,
 	uint32_t cwperpage = (mtd->writesize >> 9);
 	int err, submitted_num_desc = 0;
 	uint32_t n = 0, num_zero_bits = 0, total_ecc_byte_cnt;
+	uint32_t cw_desc_cnt = 1;
+	struct sps_command_element *curr_ce, *start_ce;
 	struct msm_nand_rw_reg_data data;
 	struct sps_iovec *iovec;
-	struct msm_nand_sps_cmd *sps_cmd;
 	struct sps_iovec iovec_temp;
 	struct mtd_oob_ops raw_ops;
 
@@ -1525,7 +1759,6 @@ static int msm_nand_is_erased_page_ps(struct mtd_info *mtd, loff_t from,
 	struct msm_nand_read_status_desc *status_desc = NULL;
 	uint32_t flash_cmd = 0x0;
 	struct {
-		struct msm_nand_sps_cmd cmd;
 		struct sps_transfer xfer;
 		struct sps_iovec cmd_iovec[MAX_DESC];
 		struct {
@@ -1550,7 +1783,6 @@ static int msm_nand_is_erased_page_ps(struct mtd_info *mtd, loff_t from,
 	wait_event(chip->dma_wait_queue, (dma_buffer = msm_nand_get_dma_buffer(
 					chip, sizeof(*dma_buffer))));
 
-	sps_cmd = &dma_buffer->cmd;
 	memset(&data, 0, sizeof(struct msm_nand_rw_reg_data));
 	msm_nand_update_rw_reg_data(chip, &raw_ops, rw_params, &data);
 
@@ -1579,6 +1811,15 @@ static int msm_nand_is_erased_page_ps(struct mtd_info *mtd, loff_t from,
 	}
 	msm_nand_prep_read_cmd_desc_pagescope(&raw_ops, rw_params, &data,
 			info, cmd_list, chip->ecc_parity_bytes);
+
+	start_ce = &cmd_list->cw_desc[cw_desc_cnt].ce[0];
+	curr_ce = start_ce;
+	cmd_list->cw_desc[cw_desc_cnt].flags = CMD | INT_UNLCK;
+	cmd_list->count++;
+	msm_nand_prep_ce(curr_ce, MSM_NAND_AUTO_STATUS_EN(info),
+			WRITE, flash_cmd);
+	curr_ce++;
+	cmd_list->cw_desc[cw_desc_cnt].num_ce = curr_ce - start_ce;
 
 	dma_buffer->xfer.iovec_count = cmd_list->count;
 	dma_buffer->xfer.iovec = dma_buffer->cmd_iovec;
@@ -1667,29 +1908,6 @@ static int msm_nand_is_erased_page_ps(struct mtd_info *mtd, loff_t from,
 				(info->sps.data_prod_stat.index), err);
 		goto put_dev;
 	}
-	/*
-	 * There is a H/W BUG in qpic 2.0. You should unlock the command
-	 * pipe only after all the status descriptors are collected on
-	 * status descriptor pipe (pipe#3).
-	 */
-
-	/* Unlock the command pipe now */
-	msm_nand_prep_single_desc(sps_cmd, MSM_NAND_AUTO_STATUS_EN(info),
-			WRITE, flash_cmd, INT_UNLCK);
-	err = sps_transfer_one(info->sps.cmd_pipe.handle,
-			msm_virt_to_dma(chip, &sps_cmd->ce),
-			sizeof(struct sps_command_element), NULL,
-			sps_cmd->flags);
-	if (err) {
-		pr_err("Failed to unlock cmd desc. pipe: %d\n", err);
-		goto put_dev;
-	}
-	err = msm_nand_sps_get_iovec(info->sps.cmd_pipe.handle,
-			info->sps.cmd_pipe.index, 1, &iovec_temp);
-	if (err) {
-		pr_err("Failed to get iovec for cmd desc. err:%d\n", err);
-		goto put_dev;
-	}
 	err = msm_nand_put_device(chip->dev);
 	mutex_unlock(&info->lock);
 	if (err)
@@ -1762,7 +1980,6 @@ static int msm_nand_read_pagescope(struct mtd_info *mtd, loff_t from,
 	struct msm_nand_rw_params rw_params;
 	struct msm_nand_rw_reg_data data;
 	struct sps_iovec *iovec;
-	struct msm_nand_sps_cmd *sps_cmd;
 	struct sps_iovec iovec_temp;
 	bool erased_page;
 	uint64_t fix_data_in_pages = 0;
@@ -1775,7 +1992,6 @@ static int msm_nand_read_pagescope(struct mtd_info *mtd, loff_t from,
 	 * read_location_last_cw_1, exec.
 	 */
 	struct {
-		struct msm_nand_sps_cmd cmd;
 		struct sps_transfer xfer;
 		struct sps_iovec cmd_iovec[MAX_DESC];
 		struct {
@@ -1804,7 +2020,6 @@ static int msm_nand_read_pagescope(struct mtd_info *mtd, loff_t from,
 	rw_params.oob_col = rw_params.start_sector * chip->cw_size;
 	if (chip->cfg1 & (1 << WIDE_FLASH))
 		rw_params.oob_col >>= 1;
-	sps_cmd = &dma_buffer->cmd;
 
 	memset(&data, 0, sizeof(struct msm_nand_rw_reg_data));
 	msm_nand_update_rw_reg_data(chip, ops, &rw_params, &data);
@@ -1817,12 +2032,14 @@ static int msm_nand_read_pagescope(struct mtd_info *mtd, loff_t from,
 	}
 
 	cmd_list = (struct msm_nand_rw_cmd_desc *)&dma_buffer->cmd_list;
-	status_desc =
-		(struct msm_nand_read_status_desc *)&dma_buffer->result[0];
 	ecc_capability = flash_dev->ecc_capability;
 
 	while (rw_params.page_count-- > 0) {
 
+		uint32_t cw_desc_cnt = 1;
+		struct sps_command_element *curr_ce, *start_ce;
+		status_desc =
+			(struct msm_nand_read_status_desc *)&dma_buffer->result[0];
 		erased_page = false;
 		data.addr0 = (rw_params.page << 16) | rw_params.oob_col;
 		data.addr1 = (rw_params.page >> 16) & 0xff;
@@ -1835,6 +2052,15 @@ static int msm_nand_read_pagescope(struct mtd_info *mtd, loff_t from,
 		msm_nand_prep_read_cmd_desc_pagescope(ops, &rw_params,
 							&data, info,
 						cmd_list, 0);
+		start_ce = &cmd_list->cw_desc[cw_desc_cnt].ce[0];
+		curr_ce = start_ce;
+		cmd_list->cw_desc[cw_desc_cnt].flags = CMD | INT_UNLCK;
+		cmd_list->count++;
+		msm_nand_prep_ce(curr_ce, MSM_NAND_AUTO_STATUS_EN(info),
+				WRITE, flash_cmd);
+		curr_ce++;
+		cmd_list->cw_desc[cw_desc_cnt].num_ce = curr_ce - start_ce;
+
 		dma_buffer->xfer.iovec_count = cmd_list->count;
 		dma_buffer->xfer.iovec = dma_buffer->cmd_iovec;
 		dma_buffer->xfer.iovec_phys = msm_virt_to_dma(chip,
@@ -1929,31 +2155,7 @@ static int msm_nand_read_pagescope(struct mtd_info *mtd, loff_t from,
 				(info->sps.data_prod_stat.index), err);
 			goto put_dev;
 		}
-		/*
-		 * There is a H/W BUG in qpic 2.0. You should unlock the command
-		 * pipe only after all the status descriptors are collected on
-		 * status descriptor pipe (pipe#3).
-		 */
 
-		/* Unlock the command pipe now */
-		msm_nand_prep_single_desc(sps_cmd,
-						MSM_NAND_AUTO_STATUS_EN(info),
-						WRITE, flash_cmd, INT_UNLCK);
-		err = sps_transfer_one(info->sps.cmd_pipe.handle,
-					msm_virt_to_dma(chip, &sps_cmd->ce),
-					sizeof(struct sps_command_element),
-					NULL, sps_cmd->flags);
-		if (err) {
-			pr_err("Failed to unlock cmd desc. pipe: %d\n", err);
-			goto put_dev;
-		}
-		err = msm_nand_sps_get_iovec(info->sps.cmd_pipe.handle,
-				info->sps.cmd_pipe.index, 1, &iovec_temp);
-		if (err) {
-			pr_err("Failed to get iovec for cmd desc. err:%d\n",
-									err);
-			goto put_dev;
-		}
 		err = msm_nand_put_device(chip->dev);
 		mutex_unlock(&info->lock);
 		if (err)
@@ -2440,6 +2642,9 @@ static int msm_nand_read_oob(struct mtd_info *mtd, loff_t from,
 		data.addr0 = (rw_params.page << 16) | rw_params.oob_col;
 		data.addr1 = (rw_params.page >> 16) & 0xff;
 
+		if (ops->len <= ONE_CODEWORD_SIZE)
+			cwperpage = 1;
+
 		for (n = rw_params.start_sector; n < cwperpage; n++) {
 			struct sps_command_element *curr_ce, *start_ce;
 
@@ -2517,7 +2722,7 @@ static int msm_nand_read_oob(struct mtd_info *mtd, loff_t from,
 		} else if (ops->mode == MTD_OPS_AUTO_OOB) {
 			if (ops->datbuf)
 				submitted_num_desc = cwperpage -
-							rw_params.start_sector;
+					rw_params.start_sector;
 			if (ops->oobbuf)
 				submitted_num_desc++;
 		}
@@ -2696,7 +2901,10 @@ free_dma:
 	}
 validate_mtd_params_failed:
 	if (ops->mode != MTD_OPS_RAW)
-		ops->retlen = mtd->writesize * pages_read;
+		if (ops->len <= ONE_CODEWORD_SIZE)
+			ops->retlen = ONE_CODEWORD_SIZE;
+		else
+			ops->retlen = mtd->writesize * pages_read;
 	else
 		ops->retlen = (mtd->writesize +  mtd->oobsize) * pages_read;
 	ops->oobretlen = ops->ooblen - rw_params.oob_len_data;
@@ -2765,10 +2973,20 @@ static int msm_nand_read_partial_page(struct mtd_info *mtd,
 			no_copy = false;
 
 		ops->datbuf = no_copy ? actual_buf : bounce_buf;
-		if (info->nand_chip.caps & MSM_NAND_CAP_PAGE_SCOPE_READ)
+
+		/*
+		 * Do a Pagescope read only if PAGE_SCOPE_READ is enabled
+		 * and request length is greater than codeword size or
+		 * the page offset is not aligned to start of the page.
+		 */
+		if ((info->nand_chip.caps & MSM_NAND_CAP_PAGE_SCOPE_READ) &&
+				((len > ONE_CODEWORD_SIZE) || (offset != 0)))
 			err = msm_nand_read_pagescope(mtd, aligned_from, ops);
-		else
+		else {
+			if ((len <= ONE_CODEWORD_SIZE) && (offset == 0))
+				ops->len = ONE_CODEWORD_SIZE;
 			err = msm_nand_read_oob(mtd, aligned_from, ops);
+		}
 		if (err == -EUCLEAN) {
 			is_euclean = 1;
 			err = 0;
@@ -4317,7 +4535,10 @@ static int msm_nand_probe(struct platform_device *pdev)
 		goto free_bam;
 	}
 	info->nand_chip.qpic_version = qpic_version.qpic_major;
-	if (info->nand_chip.qpic_version >= 2) {
+	info->nand_chip.qpic_min_version = qpic_version.qpic_minor;
+	if (info->nand_chip.qpic_version >= 2 &&
+			info->nand_chip.qpic_min_version >= 1) {
+		info->nand_chip.caps = MSM_NAND_CAP_PAGE_SCOPE_READ;
 		mutex_lock(&info->lock);
 		err = msm_nand_get_device(info->nand_chip.dev);
 		if (err) {
@@ -4366,6 +4587,8 @@ static int msm_nand_probe(struct platform_device *pdev)
 	pr_info("Allocated DMA buffer at virt_addr 0x%pK, phys_addr 0x%x\n",
 		info->nand_chip.dma_virt_addr, info->nand_chip.dma_phys_addr);
 	pr_info("Host capabilities:0x%08x\n", info->nand_chip.caps);
+	dev_node = dev;
+	msm_nand_bam_register_panic_handler();
 	goto out;
 free_bam:
 	msm_nand_bam_free(info);
@@ -4387,6 +4610,7 @@ static int msm_nand_remove(struct platform_device *pdev)
 {
 	struct msm_nand_info *info = dev_get_drvdata(&pdev->dev);
 
+	msm_nand_bam_unregister_panic_handler();
 	if (pm_runtime_suspended(&(pdev)->dev))
 		pm_runtime_resume(&(pdev)->dev);
 
@@ -4397,8 +4621,7 @@ static int msm_nand_remove(struct platform_device *pdev)
 
 	if (info) {
 		msm_nand_setup_clocks_and_bus_bw(info, false);
-		if (info->clk_data.client_handle)
-			msm_nand_bus_unregister(info);
+		msm_nand_bus_unregister(info);
 		mtd_device_unregister(&info->mtd);
 		msm_nand_bam_free(info);
 	}

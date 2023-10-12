@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2020, Linux Foundation. All rights reserved.
+ * Copyright (c) 2020 - 2021, Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -23,12 +23,13 @@
 #define MINIMUM_DUN_SIZE 512
 #define MAXIMUM_DUN_SIZE 65536
 
-static struct cqhci_host_crypto_variant_ops cqhci_crypto_qti_variant_ops = {
+static struct cqhci_host_crypto_variant_ops __maybe_unused cqhci_crypto_qti_variant_ops = {
 	.host_init_crypto = cqhci_crypto_qti_init_crypto,
 	.enable = cqhci_crypto_qti_enable,
 	.disable = cqhci_crypto_qti_disable,
 	.resume = cqhci_crypto_qti_resume,
 	.debug = cqhci_crypto_qti_debug,
+	.recovery_finish = cqhci_crypto_qti_recovery_finish,
 };
 
 static bool ice_cap_idx_valid(struct cqhci_host *host,
@@ -210,19 +211,20 @@ int cqhci_host_init_crypto_qti_spec(struct cqhci_host *host,
 				host->crypto_cap_array[cap_idx].sdus_mask * 512;
 	}
 
-	host->ksm = keyslot_manager_create(host->mmc->parent,
+	host->mmc->ksm = keyslot_manager_create(host->mmc->parent,
 				       cqhci_num_keyslots(host), ksm_ops,
-				       BLK_CRYPTO_FEATURE_STANDARD_KEYS |
 				       BLK_CRYPTO_FEATURE_WRAPPED_KEYS,
 				       crypto_modes_supported,
 				       host);
 
-	keyslot_manager_set_max_dun_bytes(host->ksm, sizeof(u32));
-
-	if (!host->ksm) {
+	if (!host->mmc->ksm) {
 		err = -ENOMEM;
 		goto out;
 	}
+
+	host->mmc->caps2 |= MMC_CAP2_CRYPTO;
+	keyslot_manager_set_max_dun_bytes(host->mmc->ksm, sizeof(u32));
+
 	/*
 	 * In case host controller supports cryptographic operations
 	 * then, it uses 128bit task descriptor. Upper 64 bits of task
@@ -243,6 +245,8 @@ int cqhci_crypto_qti_init_crypto(struct cqhci_host *host,
 {
 	int err = 0;
 	struct resource *cqhci_ice_memres = NULL;
+	struct resource *hwkm_ice_memres = NULL;
+	void __iomem *hwkm_ice_mmio = NULL;
 
 	cqhci_ice_memres = platform_get_resource_byname(host->pdev,
 							IORESOURCE_MEM,
@@ -250,7 +254,8 @@ int cqhci_crypto_qti_init_crypto(struct cqhci_host *host,
 	if (!cqhci_ice_memres) {
 		pr_debug("%s ICE not supported\n", __func__);
 		host->icemmio = NULL;
-		return PTR_ERR(cqhci_ice_memres);
+		host->caps &= ~CQHCI_CAP_CRYPTO_SUPPORT;
+		return err;
 	}
 
 	host->icemmio = devm_ioremap(&host->pdev->dev,
@@ -261,6 +266,24 @@ int cqhci_crypto_qti_init_crypto(struct cqhci_host *host,
 		return PTR_ERR(host->icemmio);
 	}
 
+	hwkm_ice_memres = platform_get_resource_byname(host->pdev,
+						       IORESOURCE_MEM,
+						       "cqhci_ice_hwkm");
+
+	if (!hwkm_ice_memres) {
+		pr_err("%s: Either no entry in dtsi or no memory available for IORESOURCE\n",
+		       __func__);
+	} else {
+		hwkm_ice_mmio = devm_ioremap_resource(&host->pdev->dev,
+						      hwkm_ice_memres);
+		if (IS_ERR(hwkm_ice_mmio)) {
+			err = PTR_ERR(hwkm_ice_mmio);
+			pr_err("%s: Error = %d mapping HWKM memory\n",
+				__func__, err);
+			return err;
+		}
+	}
+
 	err = cqhci_host_init_crypto_qti_spec(host, &cqhci_crypto_qti_ksm_ops);
 	if (err) {
 		pr_err("%s: Error initiating crypto capabilities, err %d\n",
@@ -268,8 +291,9 @@ int cqhci_crypto_qti_init_crypto(struct cqhci_host *host,
 		return err;
 	}
 
-	err = crypto_qti_init_crypto(&host->pdev->dev,
-			host->icemmio, (void **)&host->crypto_vops->priv);
+	err = crypto_qti_init_crypto(&host->pdev->dev, host->icemmio,
+				     hwkm_ice_mmio,
+				     (void **)&host->crypto_vops->priv);
 	if (err) {
 		pr_err("%s: Error initiating crypto, err %d\n",
 					__func__, err);
@@ -286,8 +310,18 @@ void cqhci_crypto_qti_set_vops(struct cqhci_host *host)
 {
 	return cqhci_crypto_set_vops(host, &cqhci_crypto_qti_variant_ops);
 }
+EXPORT_SYMBOL(cqhci_crypto_qti_set_vops);
 
 int cqhci_crypto_qti_resume(struct cqhci_host *host)
 {
 	return crypto_qti_resume(host->crypto_vops->priv);
 }
+
+int cqhci_crypto_qti_recovery_finish(struct cqhci_host *host)
+{
+	keyslot_manager_reprogram_all_keys(host->mmc->ksm);
+	return 0;
+}
+
+MODULE_DESCRIPTION("Vendor specific CQHCI Crypto Engine Support");
+MODULE_LICENSE("GPL v2");

@@ -33,6 +33,9 @@
 
 bool g_once_usb_thermal = false;
 bool g_asuslib_init = false;
+bool g_cos_over_full_flag = false;
+volatile int g_ultra_cos_spec_time = 2880;
+int  g_charger_mode_full_time = 0;
 
 struct iio_channel *usb_conn_temp_vadc_chan;
 static int asus_usb_online = 0;
@@ -45,6 +48,8 @@ extern int battery_chg_write(struct battery_chg_dev *bcdev, void *data, int len)
 extern int asus_extcon_set_state_sync(struct extcon_dev *edev, int cable_state);
 extern int asus_extcon_get_state(struct extcon_dev *edev);
 extern bool g_Charger_mode;
+extern bool boot_completed_flag;
+extern char *saved_command_line;
 //[---] Add the external function
 
 extern void qti_charge_notify_device_charge(void);
@@ -116,12 +121,15 @@ static struct CYCLE_COUNT_DATA g_cycle_count_data = {
     .reload_condition = 0
 };
 struct delayed_work battery_safety_work;
+struct delayed_work asus_min_check_work;
 
 #if defined ASUS_VODKA_PROJECT
 #define INIT_FV 4360
 #else
 #define INIT_FV 4450
 #endif
+extern unsigned long asus_qpnp_rtc_read_time(void);
+extern bool rtc_probe_done;
 //ASUS_BSP battery safety upgrade ---
 
 //ASUS_BS battery health upgrade +++
@@ -1053,6 +1061,12 @@ static ssize_t demo_app_status_store(struct class *c,
     ChgPD_Info.demo_app_status = tmp;
 
     tmp = ChgPD_Info.ultra_bat_life|ChgPD_Info.demo_app_status;
+//mtbf+
+    if(ChgPD_Info.b_is_MTBF_device == true && tmp == 1){
+        CHG_DBG_E("%s. MTBF device matched,cancel Batt_Protection : %d,tmp: %d", __func__, ChgPD_Info.b_is_MTBF_device, tmp);
+        return count;
+    }
+//mtbf-
     CHG_DBG("%s. set BATTMAN_OEM_Batt_Protection : %d", __func__, tmp);
     rc = oem_prop_write(BATTMAN_OEM_Batt_Protection, &tmp, 1);
     if (rc < 0) {
@@ -1080,6 +1094,12 @@ static ssize_t ultra_bat_life_store(struct class *c,
     ChgPD_Info.ultra_bat_life = tmp;
 
     tmp = ChgPD_Info.ultra_bat_life||ChgPD_Info.demo_app_status;
+//mtbf+
+    if(ChgPD_Info.b_is_MTBF_device == true && tmp == 1){
+        CHG_DBG_E("%s. MTBF device matched,cancel Batt_Protection : %d,tmp: %d", __func__, ChgPD_Info.b_is_MTBF_device, tmp);
+        return count;
+    }
+//mtbf-
     CHG_DBG("%s. set BATTMAN_OEM_Batt_Protection : %d", __func__, tmp);
     rc = oem_prop_write(BATTMAN_OEM_Batt_Protection, &tmp, 1);
     if (rc < 0) {
@@ -1169,9 +1189,10 @@ static ssize_t boot_completed_store(struct class *c,
     tmp = simple_strtol(buf, NULL, 10);
 
     ChgPD_Info.boot_completed = tmp;
+    boot_completed_flag = tmp;
 
     cancel_delayed_work_sync(&asus_set_qc_state_work);
-    schedule_delayed_work(&asus_set_qc_state_work, msecs_to_jiffies(5000));
+    schedule_delayed_work(&asus_set_qc_state_work, msecs_to_jiffies(0));
 
     return count;
 }
@@ -1209,6 +1230,22 @@ static ssize_t in_call_show(struct class *c,
 }
 static CLASS_ATTR_RW(in_call);
 
+bool fix_time = false;
+static ssize_t launchedtime_store(struct class *c,
+                    struct class_attribute *attr,
+                    const char *buf, size_t count)
+{
+    u32 tmp;
+    tmp = simple_strtol(buf, NULL, 10);
+    ChgPD_Info.launchedtime = tmp * 3600;
+    fix_time = true;
+
+    CHG_DBG_E("%s. set active time : %d", __func__, tmp);
+
+    return count;
+}
+static CLASS_ATTR_WO(launchedtime);
+
 static struct attribute *asuslib_class_attrs[] = {
     &class_attr_asus_get_FG_SoC.attr,
     &class_attr_asus_get_PlatformID.attr,
@@ -1237,6 +1274,7 @@ static struct attribute *asuslib_class_attrs[] = {
     &class_attr_set_virtualthermal.attr,
     &class_attr_boot_completed.attr,
     &class_attr_in_call.attr,
+    &class_attr_launchedtime.attr,
     NULL,
 };
 ATTRIBUTE_GROUPS(asuslib_class);
@@ -1431,7 +1469,7 @@ static void handle_notification(struct battery_chg_dev *bcdev, void *data,
                 if(g_Charger_mode){
                     schedule_delayed_work(&asus_set_qc_state_work, msecs_to_jiffies(0));
                 }else{
-                    schedule_delayed_work(&asus_set_qc_state_work, msecs_to_jiffies(2000));
+                    schedule_delayed_work(&asus_set_qc_state_work, msecs_to_jiffies(100));
                 }
             }
             pre_chg_type = Update_charger_type_msg->charger_type;
@@ -1810,8 +1848,6 @@ void set_qc_stat(int status)
         }
         break;
     default:
-        cancel_delayed_work_sync(&asus_set_qc_state_work);
-        asus_extcon_set_state_sync(quickchg_extcon, SWITCH_LEVEL0_DEFAULT);
         break;
     }
 }
@@ -1996,6 +2032,48 @@ void asus_monitor_start(int status){
     }
 }
 //start plugin work ---
+
+void monitor_charging_enable(void)
+{
+    union power_supply_propval prop = {};
+    int bat_capacity;
+    u32 tmp = 0;
+    int rc;
+
+    rc = power_supply_get_property(qti_phy_bat, POWER_SUPPLY_PROP_CAPACITY, &prop);
+    if (rc < 0)
+	pr_err("Failed to get battery SOC, rc=%d\n", rc);
+    bat_capacity = prop.intval;
+
+    if (g_Charger_mode) {
+        CHG_DBG("%s. Charger mode battery protetction monitor", __func__);
+	if (bat_capacity == 100 && !g_cos_over_full_flag) {
+		g_charger_mode_full_time ++;
+		 CHG_DBG("%s. Charger mode battery g_charger_mode_full_time  : %d", __func__, g_charger_mode_full_time);
+		if (g_charger_mode_full_time >= g_ultra_cos_spec_time) {
+                        tmp = 1;
+                        ChgPD_Info.ultra_bat_life = tmp;
+               		tmp = ChgPD_Info.ultra_bat_life||ChgPD_Info.demo_app_status;
+    			CHG_DBG("%s. set BATTMAN_OEM_Batt_Protection : %d", __func__, tmp);
+
+			rc = oem_prop_write(BATTMAN_OEM_Batt_Protection, &tmp, 1);
+			if (rc < 0) {
+				pr_err("Failed to set BATTMAN_OEM_Batt_Protection rc=%d\n", rc);
+				g_cos_over_full_flag = false;
+			} else {
+				g_cos_over_full_flag = true;
+			}
+		}
+	}
+    }
+}
+
+void asus_min_check_worker(struct work_struct *work)
+{
+    monitor_charging_enable();//Always TRUE, JEITA is decided on ADSP
+
+    schedule_delayed_work(&asus_min_check_work, msecs_to_jiffies(60000));
+}
 
 //ASUS_BSP battery safety upgrade +++
 static void init_battery_safety(struct bat_safety_condition *cond)
@@ -2311,11 +2389,8 @@ static void calculation_time_fun(int type)
 {
     unsigned long now_time;
     unsigned long temp_time = 0;
-    struct timespec64 mtNow;
 
-    ktime_get_coarse_real_ts64(&mtNow);
-
-    now_time = mtNow.tv_sec;
+    now_time = asus_qpnp_rtc_read_time();
 
     if(now_time < 0){
         pr_err("asus read rtc time failed!\n");
@@ -2331,6 +2406,12 @@ static void calculation_time_fun(int type)
                 temp_time = now_time - last_battery_total_time;
                 if(temp_time > 0)
                     g_cycle_count_data.battery_total_time += temp_time;
+                if(fix_time && ChgPD_Info.launchedtime > 864000){
+                    fix_time = false;
+                    if(g_cycle_count_data.battery_total_time > ChgPD_Info.launchedtime){
+                        g_cycle_count_data.battery_total_time = ChgPD_Info.launchedtime * 80 / 100;
+                    }
+                }
                 last_battery_total_time = now_time;
             }
         break;
@@ -2382,6 +2463,11 @@ static void update_battery_safe()
     union power_supply_propval prop = {};
 
     CHG_DBG("[BAT][CHG]%s +++", __func__);
+
+    if(rtc_probe_done != true){
+        pr_err("rtc probe is not ready");
+        return;
+    }
 
     if(g_asuslib_init != true){
         pr_err("asuslib init is not ready");
@@ -3228,6 +3314,7 @@ int asuslib_init(void) {
     int rc = 0;
     struct pmic_glink_client_data client_data = { };
     struct pmic_glink_client    *client;
+    u32 tmp = 0;
 
     printk(KERN_ERR "%s +++\n", __func__);
     // Initialize the necessary power supply
@@ -3423,8 +3510,45 @@ int asuslib_init(void) {
     battery_health_data_reset();
     schedule_delayed_work(&battery_health_work, 30 * HZ);
 
+//MTBF+
+    if (strstr(saved_command_line, "androidboot.serialno=M4AIB7N004649M6")
+    || strstr(saved_command_line, "androidboot.serialno=V1031800059")
+    || strstr(saved_command_line, "androidboot.serialno=LCAIB7N010618KE")
+    || strstr(saved_command_line, "androidboot.serialno=LCAIB7N010839V7")
+    || strstr(saved_command_line, "androidboot.serialno=LCAIB7N00943EFN")
+    || strstr(saved_command_line, "androidboot.serialno=LCAIB7N01429DYV")
+    || strstr(saved_command_line, "androidboot.serialno=LCAIB7N00472GBN")
+    || strstr(saved_command_line, "androidboot.serialno=M1AIB7N01397HYA")
+    || strstr(saved_command_line, "androidboot.serialno=LCAIB7N01303GY2")
+    || strstr(saved_command_line, "androidboot.serialno=LCAIB7N00285FXH"))
+    {
+        CHG_DBG_E("MTBF device matched");
+        ChgPD_Info.b_is_MTBF_device = true;
+        tmp = 1;
+    } else {
+        ChgPD_Info.b_is_MTBF_device = false;
+        tmp = 0;
+    }
+    oem_prop_write(BATTMAN_OEM_Set_MTBF, &tmp, 1);
+
+    if(ChgPD_Info.b_is_MTBF_device == true)
+    {
+        CHG_DBG_E("Load the asuslib_init Succesfully,cancel battery 48hours protect\n");
+        g_asuslib_init = true;
+        return rc;
+    }
+//MTBF-
+
+    //cos battery 48hours protect
+    INIT_DELAYED_WORK(&asus_min_check_work, asus_min_check_worker);
+    if(g_Charger_mode) {
+       CHG_DBG_E("Charger mode , start asus timer monitor\n");
+       schedule_delayed_work(&asus_min_check_work, msecs_to_jiffies(60000));
+    }
+
     CHG_DBG_E("Load the asuslib_init Succesfully\n");
     g_asuslib_init = true;
+
     return rc;
 }
 

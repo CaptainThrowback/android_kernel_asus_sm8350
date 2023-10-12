@@ -777,6 +777,10 @@ int f2fs_truncate(struct inode *inode)
 		return -EIO;
 	}
 
+	err = dquot_initialize(inode);
+	if (err)
+		return err;
+
 	/* we should check inline_data size */
 	if (!f2fs_may_inline_data(inode)) {
 		err = f2fs_convert_inline_inode(inode);
@@ -858,7 +862,8 @@ static void __setattr_copy(struct inode *inode, const struct iattr *attr)
 	if (ia_valid & ATTR_MODE) {
 		umode_t mode = attr->ia_mode;
 
-		if (!in_group_p(inode->i_gid) && !capable(CAP_FSETID))
+		if (!in_group_p(inode->i_gid) &&
+			!capable_wrt_inode_uidgid(inode, CAP_FSETID))
 			mode &= ~S_ISGID;
 		set_acl_inode(inode, mode);
 	}
@@ -3149,6 +3154,10 @@ static int f2fs_ioc_fsgetxattr(struct file *filp, unsigned long arg)
 	return 0;
 }
 
+#if defined ASUS_SAKE_PROJECT || defined ASUS_VODKA_PROJECT
+extern bool f2fs_attr_ignore;
+#endif
+
 static int f2fs_ioc_fssetxattr(struct file *filp, unsigned long arg)
 {
 	struct inode *inode = file_inode(filp);
@@ -3156,6 +3165,14 @@ static int f2fs_ioc_fssetxattr(struct file *filp, unsigned long arg)
 	u32 iflags;
 	int err;
 
+#if defined ASUS_SAKE_PROJECT || defined ASUS_VODKA_PROJECT
+	struct f2fs_sb_info *sbi;
+	if(f2fs_attr_ignore){
+		sbi = F2FS_I_SB(inode);
+		f2fs_err(sbi, "%s: f2fs attr prjid skip",__func__);
+		return 0;
+	}
+#endif
 	if (copy_from_user(&fa, (struct fsxattr __user *)arg, sizeof(fa)))
 		return -EFAULT;
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2018-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
  */
 
 #include <linux/delay.h>
@@ -268,6 +268,19 @@ static int poll_gmu_reg(struct adreno_device *adreno_dev,
 		gmu_core_regread(device, offsetdwords, &val);
 		if ((val & mask) == expected_val)
 			return 0;
+
+		/*
+		 * If GMU firmware fails any assertion, error message is sent
+		 * to KMD and NMI is triggered. So check if GMU is in NMI and
+		 * timeout early. Bits [11:9] of A6XX_GMU_CM3_FW_INIT_RESULT
+		 * contain GMU reset status. Non zero value here indicates that
+		 * GMU reset is active, NMI handler would eventually complete
+		 * and GMU would wait for recovery.
+		 */
+		gmu_core_regread(device, A6XX_GMU_CM3_FW_INIT_RESULT, &val);
+		if (val & 0xE00)
+			return -ETIMEDOUT;
+
 		usleep_range(10, 100);
 	}
 
@@ -436,6 +449,27 @@ int a6xx_hfi_send_feature_ctrl(struct adreno_device *adreno_dev,
 				enable ? "enable" : "disable",
 				feature_to_string(feature),
 				feature);
+	return ret;
+}
+
+int a6xx_hfi_send_set_value(struct adreno_device *adreno_dev,
+		u32 type, u32 subtype, u32 data)
+{
+	struct a6xx_gmu_device *gmu = to_a6xx_gmu(adreno_dev);
+	struct hfi_set_value_cmd cmd = {
+		.type = type,
+		.subtype = subtype,
+		.data = data,
+	};
+	int ret;
+
+	CMD_MSG_HDR(cmd, H2F_MSG_SET_VALUE);
+
+	ret = a6xx_hfi_send_generic_req(adreno_dev, &cmd);
+	if (ret)
+		dev_err(&gmu->pdev->dev,
+			"Unable to set HFI Value %d, %d to %d, error = %d\n",
+			type, subtype, data, ret);
 	return ret;
 }
 

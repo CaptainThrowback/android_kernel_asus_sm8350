@@ -135,6 +135,9 @@ static int mmc_decode_csd(struct mmc_card *card)
 			csd->erase_size = UNSTUFF_BITS(resp, 39, 7) + 1;
 			csd->erase_size <<= csd->write_blkbits - 9;
 		}
+
+		if (UNSTUFF_BITS(resp, 13, 1))
+			mmc_card_set_readonly(card);
 		break;
 	case 1:
 		/*
@@ -169,6 +172,9 @@ static int mmc_decode_csd(struct mmc_card *card)
 		csd->write_blkbits = 9;
 		csd->write_partial = 0;
 		csd->erase_size = 1;
+
+		if (UNSTUFF_BITS(resp, 13, 1))
+			mmc_card_set_readonly(card);
 		break;
 	default:
 		pr_err("%s: unrecognised CSD structure version %d\n",
@@ -841,11 +847,13 @@ try_again:
 		return err;
 
 	/*
-	 * In case CCS and S18A in the response is set, start Signal Voltage
-	 * Switch procedure. SPI mode doesn't support CMD11.
+	 * In case the S18A bit is set in the response, let's start the signal
+	 * voltage switch procedure. SPI mode doesn't support CMD11.
+	 * Note that, according to the spec, the S18A bit is not valid unless
+	 * the CCS bit is set as well. We deliberately deviate from the spec in
+	 * regards to this, which allows UHS-I to be supported for SDSC cards.
 	 */
-	if (!mmc_host_is_spi(host) && rocr &&
-	   ((*rocr & 0x41000000) == 0x41000000)) {
+	if (!mmc_host_is_spi(host) && rocr && (*rocr & 0x01000000)) {
 		err = mmc_set_uhs_voltage(host, pocr);
 		if (err == -EAGAIN) {
 			retries--;
@@ -1206,7 +1214,21 @@ static void mmc_sd_detect(struct mmc_host *host)
 {
 	int err;
 
-	mmc_get_card(host->card, NULL);
+#if defined(CONFIG_SDC_QTI)
+	/*
+	 * Try to acquire claim host. If failed to get the lock in 2 sec,
+	 * just return; This is to ensure that when this call is invoked
+	 * due to pm_suspend, not to block suspend for longer duration.
+	 */
+	pm_runtime_get_sync(&host->card->dev);
+	if (!mmc_try_claim_host(host, NULL, 2000)) {
+		pm_runtime_mark_last_busy(&host->card->dev);
+		pm_runtime_put_autosuspend(&host->card->dev);
+		return;
+	}
+#else
+	 mmc_get_card(host->card, NULL);
+#endif
 
 	/*
 	 * Just check if our card has been removed.
@@ -1237,6 +1259,7 @@ static int _mmc_sd_suspend(struct mmc_host *host)
 	}
 #endif
 	mmc_claim_host(host);
+	mmc_log_string(host, "Enter\n");
 
 	if (mmc_card_suspended(host->card))
 		goto out;
@@ -1251,6 +1274,7 @@ static int _mmc_sd_suspend(struct mmc_host *host)
 
 out:
 	mmc_release_host(host);
+	mmc_log_string(host, "Exit err: %d\n", err);
 	return err;
 }
 
@@ -1279,6 +1303,7 @@ static int _mmc_sd_resume(struct mmc_host *host)
 	int err = 0;
 
 	mmc_claim_host(host);
+	mmc_log_string(host, "Enter\n");
 
 	if (!mmc_card_suspended(host->card))
 		goto out;
@@ -1297,6 +1322,7 @@ static int _mmc_sd_resume(struct mmc_host *host)
 #endif
 out:
 	mmc_release_host(host);
+	mmc_log_string(host, "Exit err: %d\n", err);
 	return err;
 }
 
@@ -1306,6 +1332,7 @@ out:
 static int mmc_sd_resume(struct mmc_host *host)
 {
 	pm_runtime_enable(&host->card->dev);
+	mmc_log_string(host, "done\n");
 	return 0;
 }
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
  *
  */
 
@@ -1718,6 +1718,13 @@ static int qnoc_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ret = clk_bulk_prepare_enable(qp->num_qos_clks, qp->qos_clks);
+	if (ret) {
+		clk_bulk_disable_unprepare(qp->num_clks, qp->bus_clks);
+		dev_err(&pdev->dev, "failed to enable QoS clocks\n");
+		return ret;
+	}
+
 	for (i = 0; i < num_nodes; i++) {
 		size_t j;
 
@@ -1732,6 +1739,11 @@ static int qnoc_probe(struct platform_device *pdev)
 			goto err;
 		}
 
+		if (qnodes[i]->qosbox) {
+			qnodes[i]->noc_ops->set_qos(qnodes[i]);
+			qnodes[i]->qosbox->initialized = true;
+		}
+
 		node->name = qnodes[i]->name;
 		node->data = qnodes[i];
 		icc_node_add(node, provider);
@@ -1742,6 +1754,8 @@ static int qnoc_probe(struct platform_device *pdev)
 		data->nodes[i] = node;
 	}
 	data->num_nodes = num_nodes;
+
+	clk_bulk_disable_unprepare(qp->num_qos_clks, qp->qos_clks);
 
 	platform_set_drvdata(pdev, qp);
 
@@ -1758,6 +1772,7 @@ err:
 		icc_node_destroy(node->id);
 	}
 
+	clk_bulk_disable_unprepare(qp->num_qos_clks, qp->qos_clks);
 	clk_bulk_disable_unprepare(qp->num_clks, qp->bus_clks);
 	icc_provider_del(provider);
 	return ret;
@@ -1800,7 +1815,7 @@ static void qnoc_sync_state(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct qcom_icc_provider *qp = platform_get_drvdata(pdev);
-	int ret, i;
+	int ret = 0, i;
 
 	mutex_lock(&probe_list_lock);
 	probe_count++;
@@ -1824,11 +1839,11 @@ static void qnoc_sync_state(struct device *dev)
 				else
 					ret = clk_set_rate(qp->bus_clks[i].clk,
 						qp->bus_clk_cur_rate[i]);
-			}
 
-			if (ret)
-				pr_err("%s clk_set_rate error: %d\n",
-					qp->bus_clks[i].id, ret);
+				if (ret)
+					pr_err("%s clk_set_rate error: %d\n",
+						qp->bus_clks[i].id, ret);
+			}
 		}
 	}
 

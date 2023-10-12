@@ -49,7 +49,7 @@
 /* from BKL pushdown */
 DEFINE_MUTEX(drm_global_mutex);
 
-#define MAX_DRM_OPEN_COUNT		128
+#define MAX_DRM_OPEN_COUNT		4096
 
 /**
  * DOC: file operations
@@ -216,11 +216,6 @@ void drm_file_free(struct drm_file *file)
 		return;
 
 	dev = file->minor->dev;
-
-	DRM_DEBUG("pid = %d, device = 0x%lx, open_count = %d\n",
-		  task_pid_nr(current),
-		  (long)old_encode_dev(file->minor->kdev->devt),
-		  dev->open_count);
 
 	if (drm_core_check_feature(dev, DRIVER_LEGACY) &&
 	    dev->driver->preclose)

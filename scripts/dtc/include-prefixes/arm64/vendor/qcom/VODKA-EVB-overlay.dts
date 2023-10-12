@@ -163,6 +163,7 @@
 	qcom,mdss-dsi-bl-pmic-control-type = "bl_ctrl_dcs";
 	qcom,mdss-dsi-bl-min-level = <1>;
 	qcom,mdss-dsi-bl-max-level = <1023>;
+	qcom,mdss-brightness-max-level = <1023>;
 
 	qcom,platform-te-gpio = <&tlmm 82 0>; // default is 82
 	qcom,platform-reset-gpio = <&tlmm 24 0>;
@@ -373,11 +374,11 @@
 	qcom,clk-freq-out = <400000>;
 
 	nq@28 {
-		compatible = "qcom,sn-nci";
+		compatible = "nxp,pn544";
 		reg = <0x28>;
-		qcom,sn-irq = <&tlmm 87 0x00>;
-		qcom,sn-ven = <&tlmm 62 0x00>;
-		qcom,sn-firm = <&tlmm 86 0x00>;
+		nxp,pn544-irq = <&tlmm 87 0x00>;
+		nxp,pn544-ven = <&tlmm 62 0x00>;
+		nxp,pn544-fw-dwnld = <&tlmm 86 0x00>;
 		qcom,sn-clkreq = <&tlmm 63 0x00>;
 		interrupt-parent = <&tlmm>;
 		interrupts = <87 0>;
