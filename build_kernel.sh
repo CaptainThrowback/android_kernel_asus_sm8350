@@ -2,7 +2,7 @@
 
 Defconfig_Folder=arch/arm64/configs
 Kernel_Root=$PWD
-Android_Build=~/android/build/AOSP/android-11
+Android_Build=~/android/build/AOSP/android-12.1
 Clang_Google=prebuilts/clang/host
 Prebuilt_Clang=clang-r383902
 GCC_Google_Arm64=prebuilts/gcc/linux-x86/aarch64
