@@ -66,6 +66,7 @@ export HOST_CC=$CLANG_CC
 export LD=$CLANG_LD
 
 export ASUS_BUILD_PROJECT=SAKE
+export ASUS_BUILD_NUMBER_CHIPCODE=SAKE
 
 echo
 echo "Choose DEFCONFIG"
