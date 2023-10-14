@@ -2,7 +2,7 @@
 # Synaptics TCM touchscreen driver configuration
 #
 menuconfig TOUCHSCREEN_SYNAPTICS_TCM
-	tristate "Synaptics TCM touchscreen"
+	bool "Synaptics TCM touchscreen"
 	help
 	  Say Y here if you have a Synaptics TCM touchscreen connected
 	  to your system.
